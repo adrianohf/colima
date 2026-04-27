@@ -28,7 +28,7 @@ type Process interface {
 }
 
 // Dir is the directory for daemon files.
-func Dir() string { return filepath.Join(config.Dir(), "daemon") }
+func Dir() string { return filepath.Join(config.CurrentProfile().ConfigDir(), "daemon") }
 
 // Dependency is a requirement to be fulfilled before a process can be started.
 type Dependency interface {
@@ -75,7 +75,7 @@ func (p processDeps) Install(host environment.HostActions) error {
 		for _, d := range deps {
 			if !d.Installed() {
 				if err := d.Install(host); err != nil {
-					return fmt.Errorf("error occured installing dependencies for '%s': %w", process.Name(), err)
+					return fmt.Errorf("error occurred installing dependencies for '%s': %w", process.Name(), err)
 				}
 			}
 		}

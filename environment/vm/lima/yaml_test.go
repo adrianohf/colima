@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/abiosoft/colima/config"
+	"github.com/abiosoft/colima/environment/vm/lima/limaconfig"
 	"github.com/abiosoft/colima/util"
 	"github.com/abiosoft/colima/util/fsutil"
 )
@@ -47,18 +48,22 @@ func Test_checkOverlappingMounts(t *testing.T) {
 func Test_config_Mounts(t *testing.T) {
 	fsutil.FS = fsutil.FakeFS
 	tests := []struct {
-		mounts        []string
-		isDefault     bool
-		includesCache bool
+		mounts    []string
+		isDefault bool
 	}{
 		{mounts: []string{"/User/user", "/tmp/another"}},
 		{mounts: []string{"/User/another", "/User/something", "/User/else"}},
-		{isDefault: true},
-		{mounts: []string{util.HomeDir()}, includesCache: true},
+		{mounts: []string{}, isDefault: true},
+		{mounts: nil},
+		{mounts: []string{util.HomeDir()}},
 	}
 	for i, tt := range tests {
 		t.Run(fmt.Sprint(i), func(t *testing.T) {
 			mounts := func(mounts []string) (mnts []config.Mount) {
+				if mounts != nil {
+					mnts = []config.Mount{}
+				}
+
 				for _, m := range mounts {
 					mnts = append(mnts, config.Mount{Location: m})
 				}
@@ -72,12 +77,10 @@ func Test_config_Mounts(t *testing.T) {
 
 			expectedLocations := tt.mounts
 			if tt.isDefault {
-				expectedLocations = []string{"~", "/tmp/colima"}
-			} else if !tt.includesCache {
-				expectedLocations = append([]string{config.CacheDir()}, tt.mounts...)
+				expectedLocations = []string{"~"}
 			}
 
-			sameMounts := func(expectedLocations []string, mounts []Mount) bool {
+			sameMounts := func(expectedLocations []string, mounts []limaconfig.Mount) bool {
 				sanitize := func(s string) string { return strings.TrimSuffix(s, "/") + "/" }
 				for i, m := range mounts {
 					if sanitize(m.Location) != sanitize(expectedLocations[i]) {

@@ -6,11 +6,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"runtime"
 	"strings"
 
-	"github.com/abiosoft/colima/cli"
-	"github.com/coreos/go-semver/semver"
 	"github.com/google/shlex"
 	"github.com/sirupsen/logrus"
 )
@@ -25,70 +22,6 @@ func HomeDir() string {
 	return home
 }
 
-// MacOS returns if the current OS is macOS.
-func MacOS() bool {
-	return runtime.GOOS == "darwin"
-}
-
-// MacOS13OrNewer returns if the current OS is macOS 13 or newer.
-func MacOS13OrNewerOnM1() bool {
-	return runtime.GOARCH == "arm64" && MacOS13OrNewer()
-}
-
-// MacOS13OrNewer returns if the current OS is macOS 13 or newer.
-func MacOS13OrNewer() bool {
-	if !MacOS() {
-		return false
-	}
-	ver, err := macOSProductVersion()
-	if err != nil {
-		logrus.Warnln(fmt.Errorf("error retrieving macOS version: %w", err))
-		return false
-	}
-
-	cver, err := semver.NewVersion("13.0.0")
-	if err != nil {
-		logrus.Warnln(fmt.Errorf("error parsing version: %w", err))
-		return false
-	}
-
-	return cver.Compare(*ver) <= 0
-}
-
-// RosettaRunning checks if Rosetta process is running.
-func RosettaRunning() bool {
-	if !MacOS() {
-		return false
-	}
-	cmd := cli.Command("pgrep", "oahd")
-	cmd.Stderr = nil
-	cmd.Stdout = nil
-	return cmd.Run() == nil
-}
-
-// AppendToPath appends directory to PATH.
-func AppendToPath(path, dir string) string {
-	if path == "" {
-		return dir
-	}
-	if dir == "" {
-		return path
-	}
-	return dir + ":" + path
-}
-
-// RemoveFromPath removes directory from PATH.
-func RemoveFromPath(path, dir string) string {
-	var envPath []string
-	for _, p := range strings.Split(path, ":") {
-		if strings.TrimSuffix(p, "/") == strings.TrimSuffix(dir, "/") || strings.TrimSpace(p) == "" {
-			continue
-		}
-		envPath = append(envPath, p)
-	}
-	return strings.Join(envPath, ":")
-}
-
 // RandomAvailablePort returns an available port on the host machine.
 func RandomAvailablePort() int {
 	listener, err := net.Listen("tcp", ":0")
@@ -101,6 +34,109 @@ func RandomAvailablePort() int {
 	}
 
 	return listener.Addr().(*net.TCPAddr).Port
+}
+
+// isPortAvailable checks if a specific port is available on the host.
+func isPortAvailable(port int) bool {
+	listener, err := net.Listen("tcp", fmt.Sprintf(":%d", port))
+	if err != nil {
+		return false
+	}
+	if err := listener.Close(); err != nil {
+		return false
+	}
+	return true
+}
+
+// FindAvailablePort finds the first available port starting from startPort.
+// It checks up to maxAttempts consecutive ports (startPort, startPort+1, ...).
+// Returns the available port and true if found, or 0 and false if no port is available.
+func FindAvailablePort(startPort, maxAttempts int) (int, bool) {
+	for i := range maxAttempts {
+		port := startPort + i
+		if isPortAvailable(port) {
+			return port, true
+		}
+	}
+	return 0, false
+}
+
+// HostIPAddresses returns all IPv4 addresses on the host.
+func HostIPAddresses() []net.IP {
+	var addresses []net.IP
+	ints, err := net.InterfaceAddrs()
+	if err != nil {
+		return nil
+	}
+	for i := range ints {
+		split := strings.Split(ints[i].String(), "/")
+		addr := net.ParseIP(split[0]).To4()
+		// ignore default loopback
+		if addr != nil && addr.String() != "127.0.0.1" {
+			addresses = append(addresses, addr)
+		}
+	}
+
+	return addresses
+}
+
+// SubnetAvailable checks if a subnet (in CIDR notation) does not conflict
+// with any existing host network interface addresses.
+func SubnetAvailable(subnet string) bool {
+	_, cidr, err := net.ParseCIDR(subnet)
+	if err != nil {
+		return false
+	}
+
+	addrs, err := net.InterfaceAddrs()
+	if err != nil {
+		return false
+	}
+
+	for _, addr := range addrs {
+		ip, _, err := net.ParseCIDR(addr.String())
+		if err != nil {
+			continue
+		}
+		if ip = ip.To4(); ip == nil {
+			continue
+		}
+		if cidr.Contains(ip) {
+			return false
+		}
+	}
+
+	return true
+}
+
+// RouteExists checks if a route exists for the given subnet on macOS.
+func RouteExists(subnet string) bool {
+	if !MacOS() {
+		return false
+	}
+
+	ip, _, err := net.ParseCIDR(subnet)
+	if err != nil {
+		return false
+	}
+
+	out, err := exec.Command("netstat", "-rn", "-f", "inet").Output()
+	if err != nil {
+		return false
+	}
+
+	// macOS netstat shows /24 subnets without trailing .0
+	// e.g. "192.168.100" instead of "192.168.100.0"
+	networkAddr := strings.TrimSuffix(ip.String(), ".0")
+
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) > 0 && (fields[0] == networkAddr || fields[0] == subnet) {
+			return true
+		}
+	}
+
+	return false
 }
 
 // ShellSplit splits cmd into arguments using.
@@ -134,24 +170,4 @@ func CleanPath(location string) (string, error) {
 	}
 
 	return strings.TrimSuffix(str, "/") + "/", nil
-}
-
-// macOSProductVersion returns the host's macOS version.
-func macOSProductVersion() (*semver.Version, error) {
-	cmd := exec.Command("sw_vers", "-productVersion")
-	// output is like "12.3.1\n"
-	b, err := cmd.Output()
-	if err != nil {
-		return nil, fmt.Errorf("failed to execute %v: %w", cmd.Args, err)
-	}
-	verTrimmed := strings.TrimSpace(string(b))
-	// macOS 12.4 returns just "12.4\n"
-	for strings.Count(verTrimmed, ".") < 2 {
-		verTrimmed += ".0"
-	}
-	verSem, err := semver.NewVersion(verTrimmed)
-	if err != nil {
-		return nil, fmt.Errorf("failed to parse macOS version %q: %w", verTrimmed, err)
-	}
-	return verSem, nil
 }

@@ -14,7 +14,7 @@ import (
 )
 
 // WriteYAML encodes struct to file as YAML.
-func WriteYAML(value interface{}, file string) error {
+func WriteYAML(value any, file string) error {
 	b, err := yaml.Marshal(value)
 	if err != nil {
 		return fmt.Errorf("error encoding YAML: %w", err)
@@ -76,6 +76,12 @@ func encodeYAML(conf config.Config) ([]byte, error) {
 			default:
 				continue
 			}
+		}
+
+		// nil slices are converted to untyped nil to encode as `null` instead of `[]`.
+		// this preserves nil vs empty slice distinction when the yaml is loaded back.
+		if v := reflect.ValueOf(val); v.Kind() == reflect.Slice && v.IsNil() {
+			val = nil
 		}
 
 		// lazy way, delegate node construction to the yaml library via a roundtrip.

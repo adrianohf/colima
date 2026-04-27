@@ -10,7 +10,7 @@ import (
 )
 
 // CtxKeyQuiet is the context key to mute the chain.
-var CtxKeyQuiet = struct{ quiet bool }{quiet: true}
+var CtxKeyQuiet = struct{ key string }{key: "quiet"}
 
 // errNonFatal is a non fatal error
 type errNonFatal struct {
@@ -54,7 +54,7 @@ type namedCommandChain struct {
 	log  *log.Entry
 }
 
-func (n namedCommandChain) Logger(ctx context.Context) *log.Entry {
+func (n *namedCommandChain) Logger(ctx context.Context) *log.Entry {
 	if quiet, _ := ctx.Value(CtxKeyQuiet).(bool); quiet {
 		l := log.New()
 		l.SetOutput(io.Discard)
@@ -66,7 +66,7 @@ func (n namedCommandChain) Logger(ctx context.Context) *log.Entry {
 	return n.log
 }
 
-func (n namedCommandChain) Init(ctx context.Context) *ActiveCommandChain {
+func (n *namedCommandChain) Init(ctx context.Context) *ActiveCommandChain {
 	return &ActiveCommandChain{
 		log: n.Logger(ctx),
 	}
@@ -77,7 +77,12 @@ type ActiveCommandChain struct {
 	funcs     []cFunc
 	lastStage string
 	log       *log.Entry
+
+	executing bool
 }
+
+// Logger returns the logger for the command chain.
+func (a *ActiveCommandChain) Logger() *log.Entry { return a.log }
 
 // Add adds a new function to the runner.
 func (a *ActiveCommandChain) Add(f func() error) {
@@ -86,11 +91,15 @@ func (a *ActiveCommandChain) Add(f func() error) {
 
 // Stage sets the current stage of the runner.
 func (a *ActiveCommandChain) Stage(s string) {
+	if a.executing {
+		a.log.Println(s, "...")
+		return
+	}
 	a.funcs = append(a.funcs, cFunc{s: s})
 }
 
 // Stagef is like stage with string format.
-func (a *ActiveCommandChain) Stagef(format string, s ...interface{}) {
+func (a *ActiveCommandChain) Stagef(format string, s ...any) {
 	f := fmt.Sprintf(format, s...)
 	a.Stage(f)
 }
@@ -98,7 +107,10 @@ func (a *ActiveCommandChain) Stagef(format string, s ...interface{}) {
 // Exec executes the command chain.
 // The first errored function terminates the chain and the
 // error is returned. Otherwise, returns nil.
-func (a ActiveCommandChain) Exec() error {
+func (a *ActiveCommandChain) Exec() error {
+	a.executing = true
+	defer func() { a.executing = false }()
+
 	for _, f := range a.funcs {
 		if f.f == nil {
 			if f.s != "" {

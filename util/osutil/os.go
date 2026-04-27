@@ -5,10 +5,47 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 
 	"github.com/sirupsen/logrus"
 )
+
+// EnvVar is environment variable
+type EnvVar string
+
+// Exists checks if the environment variable has been set.
+func (e EnvVar) Exists() bool {
+	_, ok := os.LookupEnv(string(e))
+	return ok
+}
+
+// Bool returns the environment variable value as boolean.
+func (e EnvVar) Bool() bool {
+	ok, _ := strconv.ParseBool(e.Val())
+	return ok
+}
+
+// Bool returns the environment variable value.
+func (e EnvVar) Val() string {
+	return os.Getenv(string(e))
+}
+
+// Or returns the environment variable value if set, otherwise returns val.
+func (e EnvVar) ValOr(val string) string {
+	if v := os.Getenv(string(e)); v != "" {
+		return v
+	}
+	return val
+}
+
+// WithPath appends p to the environment variable value as path list.
+func (e EnvVar) WithPath(p string) string {
+	if v := e.Val(); v != "" {
+		return v + string(os.PathListSeparator) + p
+	}
+	return p
+}
 
 const EnvColimaBinary = "COLIMA_BINARY"
 
@@ -40,8 +77,8 @@ func Executable() string {
 
 	if err != nil {
 		// this should never happen, thereby it is safe to do
-		logrus.Warnln(fmt.Errorf("cannot detect current running executable: %w", err))
-		logrus.Warnln("falling back to first CLI argument")
+		logrus.Traceln(fmt.Errorf("cannot detect current running executable: %w", err))
+		logrus.Traceln("falling back to first CLI argument")
 		return os.Args[0]
 	}
 

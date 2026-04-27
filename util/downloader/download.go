@@ -1,75 +1,147 @@
 package downloader
 
 import (
+	"encoding/json"
 	"fmt"
 	"os"
+	"path"
 	"path/filepath"
+	"strings"
 
 	"github.com/abiosoft/colima/config"
 	"github.com/abiosoft/colima/environment"
+	"github.com/abiosoft/colima/util/osutil"
 	"github.com/abiosoft/colima/util/shautil"
-	"github.com/abiosoft/colima/util/terminal"
 )
 
-// Download downloads file at url and saves it in the destination.
+type (
+	hostActions  = environment.HostActions
+	guestActions = environment.GuestActions
+)
+
+// Request is download request
+type Request struct {
+	URL string // request URL
+	SHA *SHA   // shasum url
+}
+
+// FileDownloader is the interface for downloading files
+type FileDownloader interface {
+	Download(r Request, destPath string) error
+}
+
+// fileDownloader is the configured downloader implementation
+var fileDownloader FileDownloader = &nativeDownloader{}
+
+// SetDownloader sets the downloader implementation based on the provided type.
+// The value should be validated before calling this function.
+func SetDownloader(v string) {
+	if v == DownloaderCurl {
+		fileDownloader = &curlDownloader{}
+	} else {
+		fileDownloader = &nativeDownloader{}
+	}
+}
+
+func init() {
+	// check environment variable for default downloader
+	if v := osutil.EnvVar(envDownloader).Val(); v != "" {
+		if d, err := ValidateDownloader(v); err == nil {
+			SetDownloader(d)
+		}
+	}
+}
+
+// DownloadToGuest downloads file at url and saves it in the destination.
 //
-// In the implementation, the file is downloaded (and cached) on the host, but copied to the desired
-// destination for the guest.
-// fileName must be a directory on the guest that does not require root access.
-func Download(host environment.HostActions, guest environment.GuestActions, url, fileName string) error {
-	d := downloader{
-		host:  host,
-		guest: guest,
+// In the implementation, the file is downloaded (and cached) on the host,
+// then copied to the guest using limactl copy.
+// filename must be an absolute path and a directory on the guest that does not require root access.
+func DownloadToGuest(host hostActions, guest guestActions, r Request, filename string) error {
+	// if file is on the filesystem, no need for download. A copy suffices
+	if strings.HasPrefix(r.URL, "/") {
+		return CopyToGuest(host, r.URL, filename)
 	}
 
-	if !d.hasCache(url) {
-		if err := d.downloadFile(url); err != nil {
-			return fmt.Errorf("error downloading '%s': %w", url, err)
+	cacheFile, err := Download(host, r)
+	if err != nil {
+		return err
+	}
+
+	return CopyToGuest(host, cacheFile, filename)
+}
+
+// CopyToGuest copies a file or directory from the host to the guest VM using limactl copy.
+func CopyToGuest(host hostActions, src, dest string) error {
+	instanceName := config.CurrentProfile().ID
+	return host.RunQuiet("limactl", "copy", "-r", src, instanceName+":"+dest)
+}
+
+// Download downloads file at url and returns the location of the downloaded file.
+func Download(host hostActions, r Request) (string, error) {
+	d := downloader{}
+
+	if !d.hasCache(r.URL) {
+		if err := d.downloadFile(r); err != nil {
+			return "", err
 		}
 	}
 
-	return guest.RunQuiet("cp", d.cacheFileName(url), fileName)
+	return CacheFilename(r.URL), nil
 }
 
-type downloader struct {
-	host  environment.HostActions
-	guest environment.GuestActions
-}
+type downloader struct{}
 
-func (d downloader) cacheFileName(url string) string {
+// CacheFilename returns the computed filename for the url.
+func CacheFilename(url string) string {
 	return filepath.Join(config.CacheDir(), "caches", shautil.SHA256(url).String())
 }
 
 func (d downloader) cacheDownloadingFileName(url string) string {
-	return d.cacheFileName(url) + ".downloading"
+	return CacheFilename(url) + ".downloading"
 }
 
-func (d downloader) downloadFile(url string) (err error) {
-	// save to a temporary file initially before renaming to the desired file after successful download
-	// this prevents having a corrupt file
-	cacheFileName := d.cacheDownloadingFileName(url)
-	if err := d.host.RunQuiet("mkdir", "-p", filepath.Dir(cacheFileName)); err != nil {
+func (d downloader) resumeInfoPath(url string) string {
+	return CacheFilename(url) + ".resume"
+}
+
+func (d downloader) downloadFile(r Request) (err error) {
+	cacheDownloadingFilename := d.cacheDownloadingFileName(r.URL)
+
+	// create cache directory
+	cacheDir := filepath.Dir(cacheDownloadingFilename)
+	if err := os.MkdirAll(cacheDir, 0755); err != nil {
 		return fmt.Errorf("error preparing cache dir: %w", err)
 	}
 
-	// get rid of curl's initial progress bar by getting the redirect url directly.
-	downloadURL, err := d.host.RunOutput("curl", "-Ls", "-o", "/dev/null", "-w", "%{url_effective}", url)
-	if err != nil {
-		return fmt.Errorf("error retrieving redirect url: %w", err)
-	}
-
-	// ask curl to resume previous download if possible "-C -"
-	if err := d.host.RunInteractive("curl", "-L", "-#", "-C", "-", "-o", cacheFileName, downloadURL); err != nil {
+	if err := fileDownloader.Download(r, cacheDownloadingFilename); err != nil {
 		return err
 	}
-	// clear curl progress line
-	terminal.ClearLine()
 
-	return d.host.RunQuiet("mv", d.cacheDownloadingFileName(url), d.cacheFileName(url))
+	// validate download if SHA is present
+	if r.SHA != nil {
+		if err := r.SHA.validateDownload(r.URL, cacheDownloadingFilename); err != nil {
+			// move file to allow subsequent re-download
+			_ = os.Rename(cacheDownloadingFilename, cacheDownloadingFilename+".invalid")
+			return fmt.Errorf("error validating SHA sum for '%s': %w", path.Base(r.URL), err)
+		}
+	}
 
+	// move completed download to final location
+	if err := os.Rename(cacheDownloadingFilename, CacheFilename(r.URL)); err != nil {
+		return fmt.Errorf("error finalizing download: %w", err)
+	}
+
+	return nil
+}
+
+func (d downloader) saveResumeInfo(url, etag string, bytesWritten int64) {
+	info := ResumeInfo{ETag: etag, BytesWritten: bytesWritten}
+	data, _ := json.Marshal(info)
+	_ = os.WriteFile(d.resumeInfoPath(url), data, 0644)
 }
 
 func (d downloader) hasCache(url string) bool {
-	_, err := os.Stat(d.cacheFileName(url))
+	_, err := os.Stat(CacheFilename(url))
 	return err == nil
 }

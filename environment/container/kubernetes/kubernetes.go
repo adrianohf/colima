@@ -12,13 +12,14 @@ import (
 	"github.com/abiosoft/colima/environment"
 	"github.com/abiosoft/colima/environment/container/containerd"
 	"github.com/abiosoft/colima/environment/container/docker"
+	"github.com/abiosoft/colima/environment/guest/systemctl"
 )
 
 // Name is container runtime name
 
 const (
 	Name           = "kubernetes"
-	DefaultVersion = "v1.27.3+k3s1"
+	DefaultVersion = "v1.35.0+k3s1"
 
 	ConfigKey = "kubernetes_config"
 )
@@ -27,6 +28,7 @@ func newRuntime(host environment.HostActions, guest environment.GuestActions) en
 	return &kubernetesRuntime{
 		host:         host,
 		guest:        guest,
+		systemctl:    systemctl.New(guest),
 		CommandChain: cli.New(Name),
 	}
 }
@@ -38,8 +40,9 @@ func init() {
 var _ environment.Container = (*kubernetesRuntime)(nil)
 
 type kubernetesRuntime struct {
-	host  environment.HostActions
-	guest environment.GuestActions
+	host      environment.HostActions
+	guest     environment.GuestActions
+	systemctl systemctl.Systemctl
 	cli.CommandChain
 }
 
@@ -104,6 +107,12 @@ func (c *kubernetesRuntime) Provision(ctx context.Context) error {
 		conf = c.config()
 	}
 
+	if conf.Version == "" {
+		// this ensure if `version` tag in `kubernetes` section in yaml is empty,
+		// it should assign with the `DefaultVersion` for the baseURL
+		conf.Version = DefaultVersion
+	}
+
 	if c.isVersionInstalled(conf.Version) {
 		// runtime has changed, ensure the required images are in the registry
 		if currentRuntime := c.runtime(); currentRuntime != "" && currentRuntime != runtime {
@@ -111,7 +120,7 @@ func (c *kubernetesRuntime) Provision(ctx context.Context) error {
 			installK3sCache(c.host, c.guest, a, log, runtime, conf.Version)
 		}
 		// other settings may have changed e.g. ingress
-		installK3sCluster(c.host, c.guest, a, runtime, conf.Version, conf.K3sArgs)
+		installK3sCluster(c.host, c.guest, a, runtime, conf.Version, conf.K3sArgs, conf.Port)
 	} else {
 		if c.isInstalled() {
 			a.Stagef("version changed to %s, downloading and installing", conf.Version)
@@ -122,7 +131,7 @@ func (c *kubernetesRuntime) Provision(ctx context.Context) error {
 				a.Stage("installing")
 			}
 		}
-		installK3s(c.host, c.guest, a, log, runtime, conf.Version, conf.K3sArgs)
+		installK3s(c.host, c.guest, a, log, runtime, conf.Version, conf.K3sArgs, conf.Port)
 	}
 
 	// this needs to happen on each startup
@@ -146,7 +155,7 @@ func (c kubernetesRuntime) Start(ctx context.Context) error {
 	}
 
 	a.Add(func() error {
-		return c.guest.Run("sudo", "service", "k3s", "start")
+		return c.systemctl.Start("k3s.service")
 	})
 	a.Retry("", time.Second*2, 10, func(int) error {
 		return c.guest.RunQuiet("kubectl", "cluster-info")
@@ -159,7 +168,7 @@ func (c kubernetesRuntime) Start(ctx context.Context) error {
 	return c.provisionKubeconfig(ctx)
 }
 
-func (c kubernetesRuntime) Stop(ctx context.Context) error {
+func (c kubernetesRuntime) Stop(ctx context.Context, force bool) error {
 	a := c.Init(ctx)
 	a.Add(func() error {
 		return c.guest.Run("k3s-killall.sh")
@@ -167,7 +176,9 @@ func (c kubernetesRuntime) Stop(ctx context.Context) error {
 
 	// k3s is buggy with external containerd for now
 	// cleanup is manual
-	a.Add(c.stopAllContainers)
+	if !force {
+		a.Add(c.stopAllContainers)
+	}
 
 	return a.Exec()
 }
@@ -246,9 +257,7 @@ func (c kubernetesRuntime) Teardown(ctx context.Context) error {
 
 	// k3s is buggy with external containerd for now
 	// cleanup is manual
-	a.Add(func() error {
-		return c.deleteAllContainers()
-	})
+	a.Add(c.deleteAllContainers)
 
 	c.teardownKubeconfig(a)
 
@@ -262,4 +271,8 @@ func (c kubernetesRuntime) Dependencies() []string {
 func (c kubernetesRuntime) Version(context.Context) string {
 	version, _ := c.host.RunOutput("kubectl", "--context", config.CurrentProfile().ID, "version", "--short")
 	return version
+}
+
+func (c *kubernetesRuntime) Update(ctx context.Context) (bool, error) {
+	return false, fmt.Errorf("update not supported for the %s runtime", Name)
 }

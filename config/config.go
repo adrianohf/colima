@@ -1,59 +1,17 @@
 package config
 
 import (
+	"fmt"
 	"net"
-	"path/filepath"
-	"strings"
 
 	"github.com/abiosoft/colima/util"
+	"github.com/abiosoft/colima/util/osutil"
 )
 
 const (
-	AppName                 = "colima"
-	SubprocessProfileEnvVar = "COLIMA_PROFILE"
+	AppName    = "colima"
+	envProfile = "COLIMA_PROFILE" // environment variable for profile name
 )
-
-var profile = ProfileInfo{ID: AppName, DisplayName: AppName, ShortName: "default"}
-
-// SetProfile sets the profile name for the application.
-// This is an avenue to test Colima without breaking an existing stable setup.
-// Not perfect, but good enough for testing.
-func SetProfile(profileName string) {
-	profile = Profile(profileName)
-}
-
-// Profile converts string to profile info.
-func Profile(name string) ProfileInfo {
-	var i ProfileInfo
-
-	switch name {
-	case "", AppName, "default":
-		i.ID = AppName
-		i.DisplayName = AppName
-		i.ShortName = "default"
-		return i
-	}
-
-	// sanitize
-	name = strings.TrimPrefix(name, "colima-")
-
-	// if custom profile is specified,
-	// use a prefix to prevent possible name clashes
-	i.ID = "colima-" + name
-	i.DisplayName = "colima [profile=" + name + "]"
-	i.ShortName = name
-	return i
-}
-
-// CurrentProfile returns the current application profile.
-func CurrentProfile() ProfileInfo { return profile }
-
-// ProfileInfo is information about the colima profile.
-type ProfileInfo struct {
-	ID          string
-	DisplayName string
-	ShortName   string
-}
 
 // VersionInfo is the application version info.
 type VersionInfo struct {
@@ -62,6 +20,7 @@ type VersionInfo struct {
 }
 
 func AppVersion() VersionInfo { return VersionInfo{Version: appVersion, Revision: revision} }
+func EnvProfile() string      { return osutil.EnvVar(envProfile).Val() }
 
 var (
 	appVersion = "development"
@@ -70,18 +29,28 @@ var (
 
 // Config is the application config.
 type Config struct {
-	CPU          int               `yaml:"cpu,omitempty"`
-	Disk         int               `yaml:"disk,omitempty"`
-	Memory       int               `yaml:"memory,omitempty"`
-	Arch         string            `yaml:"arch,omitempty"`
-	CPUType      string            `yaml:"cpuType,omitempty"`
-	ForwardAgent bool              `yaml:"forwardAgent,omitempty"`
-	Network      Network           `yaml:"network,omitempty"`
-	Env          map[string]string `yaml:"env,omitempty"` // environment variables
+	CPU      int               `yaml:"cpu,omitempty"`
+	Disk     int               `yaml:"disk,omitempty"`
+	RootDisk int               `yaml:"rootDisk,omitempty"`
+	Memory   float32           `yaml:"memory,omitempty"`
+	Arch     string            `yaml:"arch,omitempty"`
+	CPUType  string            `yaml:"cpuType,omitempty"`
+	Network  Network           `yaml:"network,omitempty"`
+	Env      map[string]string `yaml:"env,omitempty"` // environment variables
+	Hostname string            `yaml:"hostname"`
+
+	// SSH
+	SSHPort      int  `yaml:"sshPort,omitempty"`
+	ForwardAgent bool `yaml:"forwardAgent,omitempty"`
+	SSHConfig    bool `yaml:"sshConfig,omitempty"` // config generation
 
 	// VM
-	VMType    string `yaml:"vmType,omitempty"`
-	VZRosetta bool   `yaml:"rosetta,omitempty"`
+	VMType               string `yaml:"vmType,omitempty"`
+	VZRosetta            bool   `yaml:"rosetta,omitempty"`
+	Binfmt               *bool  `yaml:"binfmt,omitempty"`
+	NestedVirtualization bool   `yaml:"nestedVirtualization,omitempty"`
+	DiskImage            string `yaml:"diskImage,omitempty"`
+	PortForwarder        string `yaml:"portForwarder,omitempty"` // "ssh", "grpc"
 
 	// volume mounts
 	Mounts       []Mount `yaml:"mounts,omitempty"`
@@ -92,20 +61,17 @@ type Config struct {
 	Runtime         string `yaml:"runtime,omitempty"`
 	ActivateRuntime *bool  `yaml:"autoActivate,omitempty"`
 
+	// ModelRunner is the AI model runner (docker, ramalama).
+	ModelRunner string `yaml:"modelRunner,omitempty"`
+
 	// Kubernetes configuration
 	Kubernetes Kubernetes `yaml:"kubernetes,omitempty"`
 
 	// Docker configuration
 	Docker map[string]any `yaml:"docker,omitempty"`
 
-	// layer
-	Layer bool `yaml:"layer,omitempty"`
-
 	// provision scripts
 	Provision []Provision `yaml:"provision,omitempty"`
-
-	// SSH config generation
-	SSHConfig bool `yaml:"sshConfig,omitempty"`
 }
 
 // Kubernetes is kubernetes configuration
@@ -113,14 +79,19 @@ type Kubernetes struct {
 	Enabled bool     `yaml:"enabled"`
 	Version string   `yaml:"version"`
 	K3sArgs []string `yaml:"k3sArgs"`
+	Port    int      `yaml:"port,omitempty"`
 }
 
 // Network is VM network configuration
 type Network struct {
-	Address      bool              `yaml:"address"`
-	DNSResolvers []net.IP          `yaml:"dns"`
-	DNSHosts     map[string]string `yaml:"dnsHosts"`
-	Driver       string            `yaml:"driver"`
+	Address         bool              `yaml:"address"`
+	DNSResolvers    []net.IP          `yaml:"dns"`
+	DNSHosts        map[string]string `yaml:"dnsHosts"`
+	HostAddresses   bool              `yaml:"hostAddresses"`
+	Mode            string            `yaml:"mode"` // shared, bridged
+	BridgeInterface string            `yaml:"interface"`
+	PreferredRoute  bool              `yaml:"preferredRoute"`
+	GatewayAddress  net.IP            `yaml:"gatewayAddress"`
 }
 
 // Mount is volume mount
@@ -130,20 +101,33 @@ type Mount struct {
 	Writable   bool   `yaml:"writable"`
 }
 
+// Provision modes managed by Colima (not passed to Lima).
+const (
+	ProvisionModeAfterBoot = "after-boot"
+	ProvisionModeReady     = "ready"
+)
+
 type Provision struct {
 	Mode   string `yaml:"mode"`
 	Script string `yaml:"script"`
 }
 
+// IsColimaMode returns true if the provision script is managed by Colima
+// rather than being passed to Lima.
+func (p Provision) IsColimaMode() bool {
+	return p.Mode == ProvisionModeAfterBoot || p.Mode == ProvisionModeReady
+}
+
 func (c Config) MountsOrDefault() []Mount {
-	if len(c.Mounts) > 0 {
-		return c.Mounts
+	// explicit empty list means mount home directory (matches yaml.go)
+	if c.Mounts != nil && len(c.Mounts) == 0 {
+		return []Mount{
+			{Location: util.HomeDir(), Writable: true},
+		}
 	}
 
-	return []Mount{
-		{Location: util.HomeDir(), Writable: true},
-		{Location: filepath.Join("/tmp", CurrentProfile().ID), Writable: true},
-	}
+	// nil means no mounts, non-empty means user-specified mounts
+	return c.Mounts
 }
 
 // AutoActivate returns if auto-activation of host client config is enabled.
@@ -157,14 +141,25 @@ func (c Config) AutoActivate() bool {
 // Empty checks if the configuration is empty.
 func (c Config) Empty() bool { return c.Runtime == "" } // this may be better but not really needed.
 
-// CtxKey returns the context key for config.
-func CtxKey() any {
-	return struct{ name string }{name: "colima_config"}
-}
-
 func (c Config) DriverLabel() string {
 	if util.MacOS13OrNewer() && c.VMType == "vz" {
 		return "macOS Virtualization.Framework"
+	} else if util.MacOS13OrNewerOnArm() && c.VMType == "krunkit" {
+		return "Krunkit"
 	}
 	return "QEMU"
+}
+
+// Disk is an instance disk size
+type Disk int
+
+// GiB returns the string represent of the disk in GiB.
+func (d Disk) GiB() string { return fmt.Sprintf("%dGiB", d) }
+
+// Int returns the disk size in bytes.
+func (d Disk) Int() int64 { return 1024 * 1024 * 1024 * int64(d) }
+
+// CtxKey returns the context key for config.
+func CtxKey() any {
+	return struct{ name string }{name: "colima_config"}
 }

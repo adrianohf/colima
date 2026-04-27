@@ -39,6 +39,9 @@ fmt:
 .PHONY: build
 build:
 	GOOS=$(GOOS) GOARCH=$(GOARCH) go build -ldflags="$(LDFLAGS)" -o $(OUTPUT_DIR)/$(OUTPUT_BIN) ./cmd/colima
+ifeq ($(GOOS),darwin)
+	codesign -s - $(OUTPUT_DIR)/$(OUTPUT_BIN)
+endif
 	cd $(OUTPUT_DIR) && openssl sha256 -r -out $(OUTPUT_BIN).sha256sum $(OUTPUT_BIN)
 
 .PHONY: test
@@ -69,3 +72,11 @@ nix-derivation-shell:
 	$(eval DERIVATION=$(shell nix-build))
 	echo $(DERIVATION) | grep ^/nix
 	nix-shell -p $(DERIVATION)
+
+.PHONY: integration
+integration: build
+	GOARCH=$(GOARCH) COLIMA_BINARY=$(OUTPUT_DIR)/$(OUTPUT_BIN) scripts/integration.sh
+
+.PHONY: images-sha
+images-sha:
+	bash embedded/images/images_sha.sh

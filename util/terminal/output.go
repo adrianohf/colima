@@ -7,6 +7,7 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/fatih/color"
@@ -24,6 +25,8 @@ type verboseWriter struct {
 	overflow   int
 
 	lastUpdate time.Time
+
+	sync.Mutex
 }
 
 // NewVerboseWriter creates a new verbose writer.
@@ -38,6 +41,9 @@ func (v *verboseWriter) Write(p []byte) (n int, err error) {
 	if !isTerminal {
 		return os.Stdout.Write(p)
 	}
+
+	v.Lock()
+	defer v.Unlock()
 
 	for i, c := range p {
 		if c != '\n' {
@@ -66,7 +72,7 @@ func (v *verboseWriter) refresh() error {
 }
 
 func (v *verboseWriter) addLine() {
-	defer v.buf.Truncate(0)
+	defer v.buf.Reset()
 
 	// if height <=0, do not scroll
 	if v.lineHeight <= 0 {
@@ -81,6 +87,9 @@ func (v *verboseWriter) addLine() {
 }
 
 func (v *verboseWriter) Close() error {
+	v.Lock()
+	defer v.Unlock()
+
 	if v.buf.Len() > 0 {
 		if err := v.refresh(); err != nil {
 			return err
@@ -91,7 +100,7 @@ func (v *verboseWriter) Close() error {
 	return nil
 }
 
-func (v verboseWriter) sanitizeLine(line string) string {
+func (v *verboseWriter) sanitizeLine(line string) string {
 	// remove logrus noises
 	if strings.HasPrefix(line, "time=") && strings.Contains(line, "msg=") {
 		line = line[strings.Index(line, "msg=")+4:]
@@ -113,6 +122,9 @@ func (v *verboseWriter) printScreen() error {
 		line = v.sanitizeLine(line)
 		if len(line) > v.termWidth {
 			v.overflow += len(line) / v.termWidth
+			if len(line)%v.termWidth == 0 {
+				v.overflow -= 1
+			}
 		}
 		line = color.HiBlackString(line)
 		fmt.Println(line)
@@ -120,7 +132,7 @@ func (v *verboseWriter) printScreen() error {
 	return nil
 }
 
-func (v verboseWriter) clearScreen() {
+func (v *verboseWriter) clearScreen() {
 	for i := 0; i < len(v.lines)+v.overflow; i++ {
 		ClearLine()
 	}

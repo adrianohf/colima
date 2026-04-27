@@ -7,7 +7,6 @@ import (
 	"github.com/abiosoft/colima/cli"
 	"github.com/abiosoft/colima/config"
 	"github.com/abiosoft/colima/daemon/process"
-	"github.com/abiosoft/colima/daemon/process/gvproxy"
 	"github.com/abiosoft/colima/daemon/process/inotify"
 	"github.com/abiosoft/colima/daemon/process/vmnet"
 	"github.com/abiosoft/colima/environment"
@@ -21,7 +20,7 @@ type Manager interface {
 	Start(context.Context, config.Config) error
 	Stop(context.Context, config.Config) error
 	Running(context.Context, config.Config) (Status, error)
-	Dependencies(context.Context, config.Config) (deps process.Dependency, root bool)
+	Dependency(ctx context.Context, conf config.Config, name string) (deps process.Dependency, root bool)
 }
 
 type Status struct {
@@ -51,9 +50,16 @@ type processManager struct {
 	host environment.HostActions
 }
 
-func (l processManager) Dependencies(ctx context.Context, conf config.Config) (deps process.Dependency, root bool) {
+func (l processManager) Dependency(ctx context.Context, conf config.Config, name string) (deps process.Dependency, root bool) {
 	processes := processesFromConfig(conf)
-	return process.Dependencies(processes...)
+
+	for _, p := range processes {
+		if p.Name() == name {
+			return process.Dependencies(p)
+		}
+	}
+
+	return process.Dependencies()
 }
 
 func (l processManager) init() error {
@@ -88,13 +94,15 @@ func (l processManager) Start(ctx context.Context, conf config.Config) error {
 	_ = l.Stop(ctx, conf) // this is safe, nothing is done when not running
 
 	if err := l.init(); err != nil {
-		return fmt.Errorf("error preparing network directory: %w", err)
+		return fmt.Errorf("error preparing daemon directory: %w", err)
 	}
 
 	args := []string{osutil.Executable(), "daemon", "start", config.CurrentProfile().ShortName}
 
 	if conf.Network.Address {
 		args = append(args, "--vmnet")
+		args = append(args, "--vmnet-mode", conf.Network.Mode)
+		args = append(args, "--vmnet-interface", conf.Network.BridgeInterface)
 	}
 	if conf.MountINotify {
 		args = append(args, "--inotify")
@@ -105,14 +113,6 @@ func (l processManager) Start(ctx context.Context, conf config.Config) error {
 				return fmt.Errorf("error sanitising mount path for inotify: %w", err)
 			}
 			args = append(args, "--inotify-dir", p)
-		}
-	}
-	if conf.Network.Driver == gvproxy.Name {
-		args = append(args, "--gvproxy")
-		if len(conf.Network.DNSHosts) > 0 {
-			for host, ip := range conf.Network.DNSHosts {
-				args = append(args, "--gvproxy-hosts", host+"="+ip)
-			}
 		}
 	}
 
@@ -134,10 +134,7 @@ func processesFromConfig(conf config.Config) []process.Process {
 	var processes []process.Process
 
 	if conf.Network.Address {
-		processes = append(processes, vmnet.New())
-	}
-	if conf.Network.Driver == gvproxy.Name {
-		processes = append(processes, gvproxy.New(conf.Network.DNSHosts))
+		processes = append(processes, vmnet.New(conf.Network.Mode, conf.Network.BridgeInterface))
 	}
 	if conf.MountINotify {
 		processes = append(processes, inotify.New())

@@ -2,21 +2,28 @@ package cmd
 
 import (
 	"fmt"
+	"net"
 	"os"
+	"os/signal"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"time"
 
+	"github.com/abiosoft/colima/app"
 	"github.com/abiosoft/colima/cli"
 	"github.com/abiosoft/colima/cmd/root"
 	"github.com/abiosoft/colima/config"
 	"github.com/abiosoft/colima/config/configmanager"
-	"github.com/abiosoft/colima/daemon/process/gvproxy"
+	"github.com/abiosoft/colima/core"
 	"github.com/abiosoft/colima/embedded"
 	"github.com/abiosoft/colima/environment"
 	"github.com/abiosoft/colima/environment/container/docker"
+	"github.com/abiosoft/colima/environment/container/incus"
 	"github.com/abiosoft/colima/environment/container/kubernetes"
 	"github.com/abiosoft/colima/util"
+	"github.com/abiosoft/colima/util/downloader"
+	"github.com/abiosoft/colima/util/osutil"
 	log "github.com/sirupsen/logrus"
 	"github.com/spf13/cobra"
 )
@@ -32,6 +39,7 @@ Run 'colima template' to set the default configurations or 'colima start --edit'
 `,
 	Example: "  colima start\n" +
 		"  colima start --edit\n" +
+		"  colima start --foreground\n" +
 		"  colima start --runtime containerd\n" +
 		"  colima start --kubernetes\n" +
 		"  colima start --runtime containerd --kubernetes\n" +
@@ -39,7 +47,8 @@ Run 'colima template' to set the default configurations or 'colima start --edit'
 		"  colima start --arch aarch64\n" +
 		"  colima start --dns 1.1.1.1 --dns 8.8.8.8\n" +
 		"  colima start --dns-host example.com=1.2.3.4\n" +
-		"  colima start --kubernetes --kubernetes-disable=coredns,servicelb,traefik,local-storage,metrics-server",
+		"  colima start --gateway-address 192.168.6.2\n" +
+		"  colima start --kubernetes --k3s-arg='\"--disable=coredns,servicelb,traefik,local-storage,metrics-server\"'",
 	Args: cobra.MaximumNArgs(1),
 	RunE: func(cmd *cobra.Command, args []string) error {
 		app := newApp()
@@ -50,18 +59,13 @@ Run 'colima template' to set the default configurations or 'colima start --edit'
 				log.Warnln("already running, ignoring")
 				return nil
 			}
-			return app.Start(conf)
+			return start(app, conf)
 		}
 
 		// edit flag is specified
-		err := editConfigFile()
+		conf, err := editConfigFile()
 		if err != nil {
 			return err
-		}
-
-		conf, err = configmanager.Load()
-		if err != nil {
-			return fmt.Errorf("error opening config file: %w", err)
 		}
 
 		// validate config
@@ -80,9 +84,14 @@ Run 'colima template' to set the default configurations or 'colima start --edit'
 			time.Sleep(time.Second * 3)
 		}
 
-		return app.Start(conf)
+		return start(app, conf)
 	},
 	PreRunE: func(cmd *cobra.Command, args []string) error {
+		// validate Lima version
+		if err := core.LimaVersionSupported(); err != nil {
+			return fmt.Errorf("lima compatibility error: %w", err)
+		}
+
 		// combine args and current config file(if any)
 		prepareConfig(cmd)
 
@@ -91,9 +100,20 @@ Run 'colima template' to set the default configurations or 'colima start --edit'
 			return fmt.Errorf("error in config: %w", err)
 		}
 
-		// persist in preparing of application start
-		if err := configmanager.Save(startCmdArgs.Config); err != nil {
-			return fmt.Errorf("error preparing config file: %w", err)
+		// persist in preparation for application start
+		if startCmdArgs.Flags.SaveConfig {
+			if err := configmanager.Save(startCmdArgs.Config); err != nil {
+				return fmt.Errorf("error preparing config file: %w", err)
+			}
+		}
+
+		// validate and set downloader if flag is specified (takes precedence over env var)
+		if cmd.Flag("downloader").Changed {
+			normalized, err := downloader.ValidateDownloader(startCmdArgs.Flags.Downloader)
+			if err != nil {
+				return err
+			}
+			downloader.SetDownloader(normalized)
 		}
 
 		return nil
@@ -103,17 +123,19 @@ Run 'colima template' to set the default configurations or 'colima start --edit'
 const (
 	defaultCPU               = 2
 	defaultMemory            = 2
-	defaultDisk              = 60
+	defaultDisk              = 100
+	defaultRootDisk          = 20
 	defaultKubernetesVersion = kubernetes.DefaultVersion
 
-	defaultNetworkDriver = "gvproxy"
-
-	defaultVMType        = "qemu"
 	defaultMountTypeQEMU = "sshfs"
 	defaultMountTypeVZ   = "virtiofs"
 )
 
-var defaultK3sArgs = []string{"--disable=traefik"}
+var (
+	defaultVMType  = "qemu"
+	defaultK3sArgs = []string{"--disable=traefik"}
+	envSaveConfig  = osutil.EnvVar("COLIMA_SAVE_CONFIG")
+)
 
 var startCmdArgs struct {
 	config.Config
@@ -125,53 +147,108 @@ var startCmdArgs struct {
 		Edit                    bool
 		Editor                  string
 		ActivateRuntime         bool
+		Binfmt                  bool
 		DNSHosts                []string
+		Foreground              bool
+		SaveConfig              bool
+		LegacyCPU               int // for backward compatibility
+		Template                bool
+		Downloader              string // downloader to use (native, curl)
 	}
 }
 
 func init() {
 	runtimes := strings.Join(environment.ContainerRuntimes(), ", ")
-	networkDrivers := strings.Join([]string{gvproxy.Name, "slirp"}, ", ")
 	defaultArch := string(environment.HostArch())
+	defaultVMType = environment.DefaultVMType()
+
+	defaultMountType := defaultMountTypeQEMU
+	if defaultVMType == "vz" {
+		defaultMountType = defaultMountTypeVZ
+	}
 
 	mounts := strings.Join([]string{defaultMountTypeQEMU, "9p", "virtiofs"}, ", ")
-	types := strings.Join([]string{defaultVMType, "vz"}, ", ")
+
+	vmTypes := []string{"qemu", "vz"}
+	if util.MacOS13OrNewerOnArm() {
+		vmTypes = append(vmTypes, "krunkit")
+	}
+	types := strings.Join(vmTypes, ", ")
+
+	saveConfigDefault := true
+	if envSaveConfig.Exists() {
+		saveConfigDefault = envSaveConfig.Bool()
+	}
 
 	root.Cmd().AddCommand(startCmd)
 	startCmd.Flags().StringVarP(&startCmdArgs.Runtime, "runtime", "r", docker.Name, "container runtime ("+runtimes+")")
-	startCmd.Flags().BoolVar(&startCmdArgs.Flags.ActivateRuntime, "activate", true, "set as active Docker/Kubernetes context on startup")
-	startCmd.Flags().IntVarP(&startCmdArgs.CPU, "cpu", "c", defaultCPU, "number of CPUs")
+	startCmd.Flags().BoolVar(&startCmdArgs.Flags.ActivateRuntime, "activate", true, "set as active Docker/Kubernetes/Incus context on startup")
+	startCmd.Flags().IntVarP(&startCmdArgs.CPU, "cpus", "c", defaultCPU, "number of CPUs")
 	startCmd.Flags().StringVar(&startCmdArgs.CPUType, "cpu-type", "", "the CPU type, options can be checked with 'qemu-system-"+defaultArch+" -cpu help'")
-	startCmd.Flags().IntVarP(&startCmdArgs.Memory, "memory", "m", defaultMemory, "memory in GiB")
+	startCmd.Flags().Float32VarP(&startCmdArgs.Memory, "memory", "m", defaultMemory, "memory in GiB")
 	startCmd.Flags().IntVarP(&startCmdArgs.Disk, "disk", "d", defaultDisk, "disk size in GiB")
+	startCmd.Flags().IntVar(&startCmdArgs.RootDisk, "root-disk", defaultRootDisk, "disk size in GiB for the root filesystem")
 	startCmd.Flags().StringVarP(&startCmdArgs.Arch, "arch", "a", defaultArch, "architecture (aarch64, x86_64)")
+	startCmd.Flags().BoolVarP(&startCmdArgs.Flags.Foreground, "foreground", "f", false, "Keep colima in the foreground")
+	startCmd.Flags().StringVar(&startCmdArgs.Hostname, "hostname", "", "custom hostname for the virtual machine")
+	startCmd.Flags().StringVarP(&startCmdArgs.DiskImage, "disk-image", "i", "", "file path to a custom disk image")
+	startCmd.Flags().BoolVar(&startCmdArgs.Flags.Template, "template", true, "use the template file for initial configuration")
 
-	// network
+	// port forwarder
+	startCmd.Flags().StringVar(&startCmdArgs.PortForwarder, "port-forwarder", "ssh", "port forwarder to use (ssh, grpc, none)")
+
+	// retain cpu flag for backward compatibility
+	startCmd.Flags().IntVar(&startCmdArgs.Flags.LegacyCPU, "cpu", defaultCPU, "number of CPUs")
+	startCmd.Flag("cpu").Hidden = true
+
+	// host IP addresses
+	startCmd.Flags().BoolVar(&startCmdArgs.Network.HostAddresses, "network-host-addresses", false, "support port forwarding to specific host IP addresses")
+
+	binfmtDesc := "use binfmt for foreign architecture emulation"
+
 	if util.MacOS() {
-		startCmd.Flags().StringVar(&startCmdArgs.Network.Driver, "network-driver", defaultNetworkDriver, "network driver to use ("+networkDrivers+")")
+		// network address
 		startCmd.Flags().BoolVar(&startCmdArgs.Network.Address, "network-address", false, "assign reachable IP address to the VM")
-	}
-	if util.MacOS13OrNewer() {
-		startCmd.Flags().StringVarP(&startCmdArgs.VMType, "vm-type", "t", defaultVMType, "virtual machine type ("+types+")")
-		if util.MacOS13OrNewerOnM1() {
-			startCmd.Flags().BoolVar(&startCmdArgs.VZRosetta, "vz-rosetta", false, "enable Rosetta for amd64 emulation")
+		startCmd.Flags().StringVar(&startCmdArgs.Network.Mode, "network-mode", "shared", "network mode (shared, bridged)")
+		startCmd.Flags().StringVar(&startCmdArgs.Network.BridgeInterface, "network-interface", "en0", "host network interface to use for bridged mode")
+		startCmd.Flags().BoolVar(&startCmdArgs.Network.PreferredRoute, "network-preferred-route", false, "use the assigned IP address as the preferred route for the VM (implies --network-address)")
+
+		// vm type
+		if util.MacOS13OrNewer() {
+			startCmd.Flags().StringVarP(&startCmdArgs.VMType, "vm-type", "t", defaultVMType, "virtual machine type ("+types+")")
+			if util.MacOS13OrNewerOnArm() {
+				startCmd.Flags().BoolVar(&startCmdArgs.VZRosetta, "vz-rosetta", false, "enable Rosetta for amd64 emulation")
+				startCmd.Flags().StringVar(&startCmdArgs.ModelRunner, "model-runner", "docker", "AI model runner (docker, ramalama)")
+				binfmtDesc += " (no-op if Rosetta is enabled)"
+			}
+		}
+
+		// nested virtualization
+		if util.MacOSNestedVirtualizationSupported() {
+			startCmd.Flags().BoolVarP(&startCmdArgs.NestedVirtualization, "nested-virtualization", "z", false, "enable nested virtualization")
 		}
 	}
+
+	// Gateway Address
+	startCmd.Flags().IPVar(&startCmdArgs.Network.GatewayAddress, "gateway-address", net.ParseIP("192.168.5.2"), "gateway address")
+
+	// binfmt
+	startCmd.Flags().BoolVar(&startCmdArgs.Flags.Binfmt, "binfmt", true, binfmtDesc)
 
 	// config
 	startCmd.Flags().BoolVarP(&startCmdArgs.Flags.Edit, "edit", "e", false, "edit the configuration file before starting")
 	startCmd.Flags().StringVar(&startCmdArgs.Flags.Editor, "editor", "", `editor to use for edit e.g. vim, nano, code (default "$EDITOR" env var)`)
+	startCmd.Flags().BoolVar(&startCmdArgs.Flags.SaveConfig, "save-config", saveConfigDefault, "persist and overwrite config file with (newly) specified flags")
 
 	// mounts
-	startCmd.Flags().StringSliceVarP(&startCmdArgs.Flags.Mounts, "mount", "V", nil, "directories to mount, suffix ':w' for writable")
-	startCmd.Flags().StringVar(&startCmdArgs.MountType, "mount-type", defaultMountTypeQEMU, "volume driver for the mount ("+mounts+")")
-	startCmd.Flags().BoolVar(&startCmdArgs.MountINotify, "mount-inotify", false, "propagate inotify file events to the VM")
+	startCmd.Flags().StringSliceVarP(&startCmdArgs.Flags.Mounts, "mount", "V", nil, "directories to mount, suffix ':w' for writable, disable with 'none'")
+	startCmd.Flags().StringVar(&startCmdArgs.MountType, "mount-type", defaultMountType, "volume driver for the mount ("+mounts+")")
+	startCmd.Flags().BoolVar(&startCmdArgs.MountINotify, "mount-inotify", true, "propagate inotify file events to the VM")
 
-	// ssh agent
+	// ssh
 	startCmd.Flags().BoolVarP(&startCmdArgs.ForwardAgent, "ssh-agent", "s", false, "forward SSH agent to the VM")
-
-	// ssh config generation
 	startCmd.Flags().BoolVar(&startCmdArgs.SSHConfig, "ssh-config", true, "generate SSH config in ~/.ssh/config")
+	startCmd.Flags().IntVar(&startCmdArgs.SSHPort, "ssh-port", 0, "SSH server port")
 
 	// k8s
 	startCmd.Flags().BoolVarP(&startCmdArgs.Kubernetes.Enabled, "kubernetes", "k", false, "start with Kubernetes")
@@ -179,11 +256,9 @@ func init() {
 	startCmd.Flags().StringVar(&startCmdArgs.Kubernetes.Version, "kubernetes-version", defaultKubernetesVersion, "must match a k3s version https://github.com/k3s-io/k3s/releases")
 	startCmd.Flags().StringSliceVar(&startCmdArgs.Flags.LegacyKubernetesDisable, "kubernetes-disable", nil, "components to disable for k3s e.g. traefik,servicelb")
 	startCmd.Flags().StringSliceVar(&startCmdArgs.Kubernetes.K3sArgs, "k3s-arg", defaultK3sArgs, "additional args to pass to k3s")
+	startCmd.Flags().IntVar(&startCmdArgs.Kubernetes.Port, "k3s-listen-port", 0, "k3s server listen port")
 	startCmd.Flag("with-kubernetes").Hidden = true
 	startCmd.Flag("kubernetes-disable").Hidden = true
-
-	// layer
-	startCmd.Flags().BoolVarP(&startCmdArgs.Layer, "layer", "l", false, "enable Ubuntu container layer")
 
 	// env
 	startCmd.Flags().StringToStringVar(&startCmdArgs.Env, "env", nil, "environment variables for the VM")
@@ -191,6 +266,9 @@ func init() {
 	// dns
 	startCmd.Flags().IPSliceVarP(&startCmdArgs.Network.DNSResolvers, "dns", "n", nil, "DNS resolvers for the VM")
 	startCmd.Flags().StringSliceVar(&startCmdArgs.Flags.DNSHosts, "dns-host", nil, "custom DNS names to provide to resolver")
+
+	// download options
+	startCmd.Flags().StringVar(&startCmdArgs.Flags.Downloader, "downloader", downloader.DownloaderNative, "downloader to use (native, curl)")
 }
 
 func dnsHostsFromFlag(hosts []string) map[string]string {
@@ -214,6 +292,12 @@ func dnsHostsFromFlag(hosts []string) map[string]string {
 func mountsFromFlag(mounts []string) []config.Mount {
 	mnts := make([]config.Mount, len(mounts))
 	for i, mount := range mounts {
+
+		// if one of the parameters is none, treat as none.
+		if strings.ToLower(mount) == "none" {
+			return nil
+		}
+
 		str := strings.SplitN(mount, ":", 3)
 		mnt := config.Mount{Location: str[0]}
 
@@ -233,13 +317,9 @@ func mountsFromFlag(mounts []string) []config.Mount {
 	return mnts
 }
 
-func setDefaults(cmd *cobra.Command) {
+func setFlagDefaults(cmd *cobra.Command) {
 	if startCmdArgs.VMType == "" {
 		startCmdArgs.VMType = defaultVMType
-	}
-
-	if startCmdArgs.Network.Driver == "" {
-		startCmdArgs.Network.Driver = defaultNetworkDriver
 	}
 
 	if util.MacOS13OrNewer() {
@@ -253,7 +333,7 @@ func setDefaults(cmd *cobra.Command) {
 	// mount type
 	{
 		// convert mount type for qemu
-		if startCmdArgs.VMType != "vz" && startCmdArgs.MountType == defaultMountTypeVZ {
+		if startCmdArgs.VMType != "vz" && startCmdArgs.VMType != "krunkit" && startCmdArgs.MountType == defaultMountTypeVZ {
 			startCmdArgs.MountType = defaultMountTypeQEMU
 			if cmd.Flag("mount-type").Changed {
 				log.Warnf("%s is only available for 'vz' vmType, using %s", defaultMountTypeVZ, defaultMountTypeQEMU)
@@ -267,12 +347,34 @@ func setDefaults(cmd *cobra.Command) {
 			}
 		}
 	}
+
+	// always enable nested virtualization for incus, if supported and not explicitly disabled.
+	if util.MacOSNestedVirtualizationSupported() {
+		if !cmd.Flag("nested-virtualization").Changed {
+			if startCmdArgs.Runtime == incus.Name && (startCmdArgs.VMType == "vz" || startCmdArgs.VMType == "krunkit") {
+				startCmdArgs.NestedVirtualization = true
+			}
+		}
+	}
+
+	// always enable network address for incus, if supported and not explicitly disabled
+	if util.MacOS13OrNewer() {
+		if !cmd.Flag("network-address").Changed {
+			if startCmdArgs.Runtime == incus.Name && startCmdArgs.VMType == "vz" {
+				startCmdArgs.Network.Address = true
+			}
+		}
+	}
 }
 
 func setConfigDefaults(conf *config.Config) {
 	// handle macOS virtualization.framework transition
 	if conf.VMType == "" {
 		conf.VMType = defaultVMType
+		// if on macOS with no qemu, use vz
+		if err := util.AssertQemuImg(); err != nil && util.MacOS13OrNewer() {
+			conf.VMType = "vz"
+		}
 	}
 
 	if conf.MountType == "" {
@@ -282,8 +384,52 @@ func setConfigDefaults(conf *config.Config) {
 		}
 	}
 
-	if conf.Network.Driver == "" {
-		conf.Network.Driver = defaultNetworkDriver
+	if conf.Hostname == "" {
+		conf.Hostname = config.CurrentProfile().ID
+	}
+
+	if conf.PortForwarder == "" {
+		conf.PortForwarder = "ssh"
+	}
+}
+
+func setFixedConfigs(conf *config.Config) {
+	fixedConf, err := configmanager.LoadFrom(config.CurrentProfile().StateFile())
+	if err != nil {
+		return
+	}
+
+	warnIfNotEqual := func(name, newVal, fixedVal string) {
+		if newVal != fixedVal {
+			log.Warnln(fmt.Errorf("'%s' cannot be updated after initial setup, discarded", name))
+		}
+	}
+
+	// override the fixed configs
+	// arch, vmType, mountType, runtime are fixed and cannot be changed
+	if fixedConf.Arch != "" {
+		warnIfNotEqual("architecture", conf.Arch, fixedConf.Arch)
+		conf.Arch = fixedConf.Arch
+	}
+	if fixedConf.VMType != "" {
+		warnIfNotEqual("virtual machine type", conf.VMType, fixedConf.VMType)
+		conf.VMType = fixedConf.VMType
+	}
+	if fixedConf.Runtime != "" {
+		warnIfNotEqual("runtime", conf.Runtime, fixedConf.Runtime)
+		conf.Runtime = fixedConf.Runtime
+	}
+	if fixedConf.MountType != "" {
+		warnIfNotEqual("volume mount type", conf.MountType, fixedConf.MountType)
+		conf.MountType = fixedConf.MountType
+	}
+	if fixedConf.Network.Address && !conf.Network.Address {
+		log.Warnln("network address cannot be disabled once enabled")
+		conf.Network.Address = true
+	}
+	if fixedConf.Network.Mode != "" {
+		warnIfNotEqual("network mode", conf.Network.Mode, fixedConf.Network.Mode)
+		conf.Network.Mode = fixedConf.Network.Mode
 	}
 }
 
@@ -301,10 +447,17 @@ func prepareConfig(cmd *cobra.Command) {
 		cmd.Flag("kubernetes").Changed = true
 	}
 
+	// handle legacy cpu flag
+	if cmd.Flag("cpu").Changed && !cmd.Flag("cpus").Changed {
+		startCmdArgs.CPU = startCmdArgs.Flags.LegacyCPU
+		cmd.Flag("cpus").Changed = true
+	}
+
 	// convert cli to config file format
 	startCmdArgs.Mounts = mountsFromFlag(startCmdArgs.Flags.Mounts)
 	startCmdArgs.Network.DNSHosts = dnsHostsFromFlag(startCmdArgs.Flags.DNSHosts)
 	startCmdArgs.ActivateRuntime = &startCmdArgs.Flags.ActivateRuntime
+	startCmdArgs.Binfmt = &startCmdArgs.Flags.Binfmt
 
 	// handle legacy kubernetes-disable
 	for _, disable := range startCmdArgs.Flags.LegacyKubernetesDisable {
@@ -312,17 +465,25 @@ func prepareConfig(cmd *cobra.Command) {
 	}
 
 	// set relevant missing default values
-	setDefaults(cmd)
+	setFlagDefaults(cmd)
 
 	// if there is no existing settings
 	if current.Empty() {
-		// attempt template
-		template, err := configmanager.LoadFrom(templateFile())
-		if err != nil {
-			// use default config if there is no template or existing settings
+		templateUsed := false
+
+		// attempt template if enabled
+		if startCmdArgs.Flags.Template {
+			template, err := configmanager.LoadFrom(templateFile())
+			if err == nil {
+				current = template
+				templateUsed = true
+			}
+		}
+
+		if !templateUsed {
+			// use default config if there is no template or template is disabled
 			return
 		}
-		current = template
 	}
 
 	// set missing defaults in the current config
@@ -341,19 +502,32 @@ func prepareConfig(cmd *cobra.Command) {
 	if !cmd.Flag("disk").Changed {
 		startCmdArgs.Disk = current.Disk
 	}
+	if !cmd.Flag("root-disk").Changed {
+		if current.RootDisk > 0 {
+			startCmdArgs.RootDisk = current.RootDisk
+		}
+	}
 	if !cmd.Flag("kubernetes").Changed {
 		startCmdArgs.Kubernetes.Enabled = current.Kubernetes.Enabled
 	}
-	if !cmd.Flag("kubernetes-version").Changed {
+	if !cmd.Flag("kubernetes-version").Changed && current.Kubernetes.Version != "" {
 		startCmdArgs.Kubernetes.Version = current.Kubernetes.Version
 	}
-	if !cmd.Flag("k3s-arg").Changed {
+	if !cmd.Flag("k3s-arg").Changed && current.Kubernetes.K3sArgs != nil {
 		startCmdArgs.Kubernetes.K3sArgs = current.Kubernetes.K3sArgs
+	}
+	if !cmd.Flag("k3s-listen-port").Changed && current.Kubernetes.Port > 0 {
+		startCmdArgs.Kubernetes.Port = current.Kubernetes.Port
 	}
 	if !cmd.Flag("runtime").Changed {
 		startCmdArgs.Runtime = current.Runtime
 	}
-	if !cmd.Flag("cpu").Changed {
+	if util.MacOS13OrNewerOnArm() {
+		if !cmd.Flag("model-runner").Changed {
+			startCmdArgs.ModelRunner = current.ModelRunner
+		}
+	}
+	if !cmd.Flag("cpus").Changed {
 		startCmdArgs.CPU = current.CPU
 	}
 	if !cmd.Flag("cpu-type").Changed {
@@ -377,49 +551,81 @@ func prepareConfig(cmd *cobra.Command) {
 	if !cmd.Flag("ssh-config").Changed {
 		startCmdArgs.SSHConfig = current.SSHConfig
 	}
+	if !cmd.Flag("ssh-port").Changed {
+		startCmdArgs.SSHPort = current.SSHPort
+	}
+	if !cmd.Flag("port-forwarder").Changed {
+		startCmdArgs.PortForwarder = current.PortForwarder
+	}
 	if !cmd.Flag("dns").Changed {
 		startCmdArgs.Network.DNSResolvers = current.Network.DNSResolvers
 	}
 	if !cmd.Flag("dns-host").Changed {
 		startCmdArgs.Network.DNSHosts = current.Network.DNSHosts
 	}
+	if !cmd.Flag("gateway-address").Changed {
+		startCmdArgs.Network.GatewayAddress = current.Network.GatewayAddress
+	}
 	if !cmd.Flag("env").Changed {
 		startCmdArgs.Env = current.Env
 	}
-	if !cmd.Flag("layer").Changed {
-		startCmdArgs.Layer = current.Layer
+	if !cmd.Flag("hostname").Changed {
+		startCmdArgs.Hostname = current.Hostname
 	}
 	if !cmd.Flag("activate").Changed {
 		if current.ActivateRuntime != nil { // backward compatibility for `activate`
 			startCmdArgs.ActivateRuntime = current.ActivateRuntime
 		}
 	}
-	if util.MacOS() {
-		if !cmd.Flag("network-driver").Changed {
-			startCmdArgs.Network.Driver = current.Network.Driver
+	if !cmd.Flag("binfmt").Changed {
+		if current.Binfmt != nil {
+			startCmdArgs.Binfmt = current.Binfmt
 		}
+	}
+	if !cmd.Flag("network-host-addresses").Changed {
+		startCmdArgs.Network.HostAddresses = current.Network.HostAddresses
+	}
+	if util.MacOS() {
 		if !cmd.Flag("network-address").Changed {
 			startCmdArgs.Network.Address = current.Network.Address
+		}
+		if !cmd.Flag("network-mode").Changed {
+			startCmdArgs.Network.Mode = current.Network.Mode
+		}
+		if !cmd.Flag("network-interface").Changed {
+			startCmdArgs.Network.BridgeInterface = current.Network.BridgeInterface
+		}
+		if !cmd.Flag("network-preferred-route").Changed {
+			startCmdArgs.Network.PreferredRoute = current.Network.PreferredRoute
 		}
 		if util.MacOS13OrNewer() {
 			if !cmd.Flag("vm-type").Changed {
 				startCmdArgs.VMType = current.VMType
 			}
 		}
-		if util.MacOS13OrNewerOnM1() {
+		if util.MacOS13OrNewerOnArm() {
 			if !cmd.Flag("vz-rosetta").Changed {
 				startCmdArgs.VZRosetta = current.VZRosetta
 			}
 		}
+		if util.MacOSNestedVirtualizationSupported() {
+			if !cmd.Flag("nested-virtualization").Changed {
+				startCmdArgs.NestedVirtualization = current.NestedVirtualization
+			}
+		}
 	}
+
+	setFixedConfigs(&startCmdArgs.Config)
 }
 
 // editConfigFile launches an editor to edit the config file.
-func editConfigFile() error {
+func editConfigFile() (config.Config, error) {
+	var c config.Config
+
 	// preserve the current file in case the user terminates
-	currentFile, err := os.ReadFile(config.File())
+	currentFile, err := os.ReadFile(config.CurrentProfile().File())
 	if err != nil {
-		return fmt.Errorf("error reading config file: %w", err)
+		return c, fmt.Errorf("error reading config file: %w", err)
 	}
 
 	// prepend the config file with termination instruction
@@ -430,16 +636,48 @@ func editConfigFile() error {
 
 	tmpFile, err := waitForUserEdit(startCmdArgs.Flags.Editor, []byte(abort+"\n"+string(currentFile)))
 	if err != nil {
-		return fmt.Errorf("error editing config file: %w", err)
+		return c, fmt.Errorf("error editing config file: %w", err)
 	}
 
 	// if file is empty, abort
 	if tmpFile == "" {
-		return fmt.Errorf("empty file, startup aborted")
+		return c, fmt.Errorf("empty file, startup aborted")
 	}
 
 	defer func() {
 		_ = os.Remove(tmpFile)
 	}()
-	return configmanager.SaveFromFile(tmpFile)
+	if startCmdArgs.Flags.SaveConfig {
+		if err := configmanager.SaveFromFile(tmpFile); err != nil {
+			return c, err
+		}
+	}
+	return configmanager.LoadFrom(tmpFile)
+}
+
+func start(app app.App, conf config.Config) error {
+	if err := app.Start(conf); err != nil {
+		return err
+	}
+	if startCmdArgs.Flags.Foreground {
+		return awaitForInterruption(app)
+	}
+	return nil
+}
+
+func awaitForInterruption(app app.App) error {
+	c := make(chan os.Signal, 1)
+	signal.Notify(c, os.Interrupt, syscall.SIGINT, syscall.SIGTERM)
+
+	log.Println("keeping Colima in the foreground, press ctrl+c to exit...")
+
+	sig := <-c
+	log.Infof("interrupted by: %v", sig)
+
+	if err := app.Stop(false); err != nil {
+		log.Errorf("error stopping: %v", err)
+		return err
+	}
+
+	return nil
 }

@@ -40,7 +40,7 @@ nix-shell -p colima
 
 Install dependencies
 ```
-sudo pacman -S qemu-base go docker
+sudo pacman -S qemu-full go docker
 ```
 Install Lima and Colima from Aur
 ```
@@ -54,10 +54,10 @@ Binaries are available with every release on the [releases page](https://github.
 
 ```sh
 # download binary
-curl -LO https://github.com/abiosoft/colima/releases/download/v0.5.3/colima-$(uname)-$(uname -m)
+curl -LO https://github.com/abiosoft/colima/releases/latest/download/colima-$(uname)-$(uname -m)
 
 # install in $PATH
-install colima-$(uname)-$(uname -m) /usr/local/bin/colima # or sudo install if /usr/local/bin requires root.
+sudo install colima-$(uname)-$(uname -m) /usr/local/bin/colima
 ```
 
 ## Building from Source
@@ -69,5 +69,5 @@ Requires [Go](https://golang.org).
 git clone https://github.com/abiosoft/colima
 cd colima
 make
-make install # or `sudo make install` if /usr/local/bin requires root
+sudo make install
 ```

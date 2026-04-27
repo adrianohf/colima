@@ -19,80 +19,50 @@ func (f *inotifyProcess) monitorContainerVolumes(ctx context.Context, c chan<- [
 	if f.runtime == "" {
 		return fmt.Errorf("empty runtime")
 	}
-	runtimeCmd := docker.Name
-	if f.runtime == containerd.Name {
-		runtimeCmd = "nerdctl"
-	}
 
 	fetch := func() ([]string, error) {
-		// fetch all containers
-		var containers []string
-		{
-			out, err := f.guest.RunOutput(runtimeCmd, "ps", "-q")
+		var vols []string
+
+		switch f.runtime {
+
+		case docker.Name:
+			vols, err := f.fetchVolumes(docker.Name)
 			if err != nil {
-				return nil, fmt.Errorf("error listing containers: %w", err)
+				return nil, fmt.Errorf("error fetching docker volumes: %w", err)
 			}
-			containers = strings.Fields(out)
-			if len(containers) == 0 {
-				return nil, nil
+			return vols, nil
+
+		case containerd.Name:
+			var namespaces []string
+			out, err := f.guest.RunOutput("sudo", "nerdctl", "namespace", "list", "-q")
+			if err != nil {
+				return nil, fmt.Errorf("error retrieving containerd namespaces: %w", err)
 			}
-		}
-
-		log.Tracef("found containers %+v", containers)
-
-		// fetch volumes
-		var resp []struct {
-			Mounts []struct {
-				Source string `json:"Source"`
-			} `json:"Mounts"`
-		}
-		{
-			args := []string{runtimeCmd, "inspect"}
-			args = append(args, containers...)
-
-			var buf bytes.Buffer
-			if err := f.guest.RunWith(nil, &buf, args...); err != nil {
-				return nil, fmt.Errorf("error inspecting containers: %w", err)
+			if out != "" {
+				namespaces = strings.Fields(out)
 			}
-			if err := json.NewDecoder(&buf).Decode(&resp); err != nil {
-				return nil, fmt.Errorf("error decoding docker response")
-			}
-		}
 
-		// process and discard redundant volumes
-		vols := []string{}
-		{
-			shouldMount := func(child string) bool {
-				// ignore all invalid directories.
-				// i.e. directories not within the mounted VM directories
-				for _, parent := range f.vmVols {
-					if strings.HasPrefix(child, parent) {
-						return true
-					}
+			for _, ns := range namespaces {
+				v, err := f.fetchVolumes("sudo", "nerdctl", "--namespace", ns)
+				if err != nil {
+					return nil, fmt.Errorf("error retrieving containerd volumes: %w", err)
 				}
-				return false
-			}
-
-			for _, r := range resp {
-				for _, mount := range r.Mounts {
-					if shouldMount(mount.Source) {
-						vols = append(vols, mount.Source)
-					}
+				if len(v) > 0 {
+					vols = append(vols, v...)
 				}
 			}
 
-			vols = omitChildrenDirectories(vols)
-			log.Tracef("found volumes %+v", vols)
+			return vols, nil
 		}
 
-		return vols, nil
+		return nil, nil
 	}
 
 	go func() {
 		for {
 			select {
 			case <-ctx.Done():
-				log.Trace("stop signal recieved")
+				log.Trace("stop signal received")
 				err := ctx.Err()
 				if err != nil {
 					log.Trace(fmt.Errorf("error during stop: %w", err))
@@ -110,6 +80,75 @@ func (f *inotifyProcess) monitorContainerVolumes(ctx context.Context, c chan<- [
 	return nil
 }
 
+func (f *inotifyProcess) fetchVolumes(cmdArgs ...string) ([]string, error) {
+	log := f.log
+
+	// fetch all containers
+	var containers []string
+	{
+		args := append([]string{}, cmdArgs...)
+		args = append(args, "ps", "-q")
+		out, err := f.guest.RunOutput(args...)
+		if err != nil {
+			return nil, fmt.Errorf("error listing containers: %w", err)
+		}
+		containers = strings.Fields(out)
+		if len(containers) == 0 {
+			return nil, nil
+		}
+	}
+
+	log.Tracef("found containers %+v", containers)
+
+	// fetch volumes
+	var resp []struct {
+		Mounts []struct {
+			Source string `json:"Source"`
+		} `json:"Mounts"`
+	}
+	{
+		args := append([]string{}, cmdArgs...)
+		args = append(args, "inspect")
+		args = append(args, containers...)
+
+		var buf bytes.Buffer
+		if err := f.guest.RunWith(nil, &buf, args...); err != nil {
+			return nil, fmt.Errorf("error inspecting containers: %w", err)
+		}
+		if err := json.NewDecoder(&buf).Decode(&resp); err != nil {
+			return nil, fmt.Errorf("error decoding docker response")
+		}
+	}
+
+	// process and discard redundant volumes
+	vols := []string{}
+	{
+		shouldMount := func(child string) bool {
+			// ignore all invalid directories.
+			// i.e. directories not within the mounted VM directories
+			for _, parent := range f.vmVols {
+				if strings.HasPrefix(child, parent) {
+					return true
+				}
+			}
+			return false
+		}
+
+		for _, r := range resp {
+			for _, mount := range r.Mounts {
+				if shouldMount(mount.Source) {
+					vols = append(vols, mount.Source)
+				}
+			}
+		}
+
+		vols = omitChildrenDirectories(vols)
+		log.Tracef("found volumes %+v", vols)
+	}
+
+	return vols, nil
+}
+
 func omitChildrenDirectories(dirs []string) []string {
 	sort.Strings(dirs) // sort to put the parent directories first
 
@@ -120,7 +159,7 @@ func omitChildrenDirectories(dirs []string) []string {
 
 	omitted := map[int]struct{}{}
 	for i := 0; i < len(dirs); i++ {
-		// if the index is ommitted, skip
+		// if the index is omitted, skip
 		if _, ok := omitted[i]; ok {
 			continue
 		}

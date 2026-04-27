@@ -2,11 +2,17 @@
 
 - [FAQs](#faqs)
   - [How does Colima compare to Lima?](#how-does-colima-compare-to-lima)
-  - [Are M1 macs supported?](#are-m1-macs-supported)
+  - [Are Apple Silicon Macs supported?](#are-apple-silicon-macs-supported)
+  - [Are AI workloads supported?](#are-ai-workloads-supported)
+  - [Are older macOS versions supported?](#are-older-macos-versions-supported)
+  - [Does Colima support autostart?](#does-colima-support-autostart)
   - [Can config file be used instead of cli flags?](#can-config-file-be-used-instead-of-cli-flags)
+    - [Specifying the config location](#specifying-the-config-location)
     - [Editing the config](#editing-the-config)
     - [Setting the default config](#setting-the-default-config)
     - [Specifying the config editor](#specifying-the-config-editor)
+  - [How do I change where Colima files are stored?](#how-do-i-change-where-colima-files-are-stored)
+  - [How do I pass custom environment variables into the VM?](#how-do-i-pass-custom-environment-variables-into-the-vm)
   - [Docker](#docker)
     - [Can it run alongside Docker for Mac?](#can-it-run-alongside-docker-for-mac)
     - [Docker socket location](#docker-socket-location)
@@ -15,42 +21,103 @@
       - [Listing Docker contexts](#listing-docker-contexts)
       - [Changing the active Docker context](#changing-the-active-docker-context)
     - [Cannot connect to the Docker daemon at unix:///var/run/docker.sock. Is the docker daemon running?](#cannot-connect-to-the-docker-daemon-at-unixvarrundockersock-is-the-docker-daemon-running)
-    - [How to customize Docker config e.g. add insecure registries?](#how-to-customize-docker-config-eg-add-insecure-registries)
-    - [Docker plugins are missing (buildx, scan)](#docker-plugins-are-missing-buildx-scan)
+    - [How to customize Docker config (e.g., adding insecure registries or registry mirrors)?](#how-to-customize-docker-config-eg-adding-insecure-registries-or-registry-mirrors)
+    - [Docker buildx plugin is missing](#docker-buildx-plugin-is-missing)
       - [Installing Buildx](#installing-buildx)
-      - [Installing Docker Scan](#installing-docker-scan)
+  - [Containerd](#containerd)
+    - [How to customize Containerd config?](#how-to-customize-containerd-config)
+      - [Per-profile overrides](#per-profile-overrides)
   - [How does Colima compare to minikube, Kind, K3d?](#how-does-colima-compare-to-minikube-kind-k3d)
     - [For Kubernetes](#for-kubernetes)
     - [For Docker](#for-docker)
   - [Is another Distro supported?](#is-another-distro-supported)
-    - [Enabling Ubuntu layer](#enabling-ubuntu-layer)
-    - [Accessing the underlying Virtual Machine](#accessing-the-underlying-virtual-machine)
+    - [Version v0.5.6 and lower](#version-v056-and-lower)
+      - [Enabling Ubuntu layer](#enabling-ubuntu-layer)
+      - [Accessing the underlying Virtual Machine](#accessing-the-underlying-virtual-machine)
+    - [Version v0.6.0 and newer](#version-v060-and-newer)
   - [The Virtual Machine's IP is not reachable](#the-virtual-machines-ip-is-not-reachable)
     - [Enable reachable IP address](#enable-reachable-ip-address)
+  - [Incus instances are not reachable from the host](#incus-instances-are-not-reachable-from-the-host)
   - [How can disk space be recovered?](#how-can-disk-space-be-recovered)
     - [Automatic](#automatic)
     - [Manual](#manual)
+  - [How can disk size be increased?](#how-can-disk-size-be-increased)
   - [Are Lima overrides supported?](#are-lima-overrides-supported)
+    - [Example: Adding provision scripts](#example-adding-provision-scripts)
+  - [How can the VM and its tools be updated?](#how-can-the-vm-and-its-tools-be-updated)
+    - [Updating Colima](#updating-colima)
+    - [Updating the container runtime](#updating-the-container-runtime)
+    - [Accessing the Virtual Machine](#accessing-the-virtual-machine)
   - [Troubleshooting](#troubleshooting)
     - [Colima not starting](#colima-not-starting)
       - [Broken status](#broken-status)
       - [FATA\[0000\] error starting vm: error at 'starting': exit status 1](#fata0000-error-starting-vm-error-at-starting-exit-status-1)
     - [Issues after an upgrade](#issues-after-an-upgrade)
     - [Colima cannot access the internet.](#colima-cannot-access-the-internet)
+    - [Docker Compose and Buildx showing runc error](#docker-compose-and-buildx-showing-runc-error)
+      - [Version v0.5.6 or lower](#version-v056-or-lower)
+    - [Issue with Docker bind mount showing empty](#issue-with-docker-bind-mount-showing-empty)
+  - [How can Docker version be updated?](#how-can-docker-version-be-updated)
+  - [How can I delete container data](#how-can-i-delete-container-data)
 
 ## How does Colima compare to Lima?
 
 Colima is basically a higher level usage of Lima and utilises Lima to provide Docker, Containerd and/or Kubernetes.
 
-## Are M1 macs supported?
+## Are Apple Silicon Macs supported?
 
-Colima supports and works on both Intel and M1 macs.
+Colima supports and works on both Intel and Apple Silicon Macs.
 
 Feedbacks would be appreciated.
+
+## Are AI workloads supported?
+
+Yes, Colima supports GPU accelerated containers for AI workloads on Apple Silicon Macs running macOS 13 or newer.
+
+To get started, start Colima with Docker runtime and krunkit VM type:
+
+```sh
+colima start --runtime docker --vm-type krunkit
+```
+
+Then setup and run AI models:
+
+```sh
+colima model setup
+colima model run gemma3
+```
+
+Multiple model registries are supported including HuggingFace (default) and Ollama:
+
+```sh
+colima model run hf://tinyllama
+colima model run ollama://tinyllama
+```
+
+For more options, run `colima model --help`.
+
+## Are older macOS versions supported?
+
+Colima is supported and regularly tested on the latest macOS version. However, Colima requires macOS 13 or newer.
+
+You may be able to build Colima and it's dependencies from source on older macOS version. Colima requires [Lima](https://github.com/lima-vm/lima) and [Qemu](https://www.qemu.org/).
+## Does Colima support autostart?
+
+Since v0.5.6 Colima supports foreground mode via the `--foreground` flag. i.e. `colima start --foreground`.
+
+If Colima has been installed using brew, the easiest way to autostart Colima is to use brew services.
+
+```sh
+brew services start colima
+```
 
 ## Can config file be used instead of cli flags?
 
 Yes, from v0.4.0, Colima support YAML configuration file.
+
+### Specifying the config location
+
+Set the `$COLIMA_HOME` environment variable, otherwise it defaults to `$HOME/.colima`.
 
 ### Editing the config
 
@@ -77,6 +144,38 @@ Set the `$EDITOR` environment variable or use the `--editor` flag.
 ```sh
 colima start --edit --editor code # one-off config
 colima template --editor code # default config
+```
+
+## How do I change where Colima files are stored?
+
+Colima supports these environment variables, set on your host machine:
+
+| Variable | Description |
+|----------|-------------|
+| `COLIMA_HOME` | Colima configuration directory (default: `$HOME/.colima`) |
+| `COLIMA_CACHE_HOME` | Colima cache directory (default is host-specific, see [os.UserCacheDir()](https://pkg.go.dev/os#UserCacheDir)) |
+| `COLIMA_PROFILE` | Active profile name (default: `default`) |
+| `DOCKER_CONFIG` | Path to Docker client configuration directory (default: `~/.docker`) |
+
+## How do I pass custom environment variables into the VM?
+
+Pass environment variables into the VM at startup using the YAML configuration file:
+
+```yaml
+env:
+  MY_VAR: value
+```
+
+You can also use command-line flags:
+
+```bash session
+# On your host machine...
+$ colima start --env MY_VAR=value
+
+# Then, within the VM...
+$ colima ssh
+user@colima:~$ env | grep MY_VAR
+MY_VAR=value
 ```
 
 ## Docker
@@ -127,7 +226,7 @@ This can be fixed by any of the following approaches. Ensure the Docker socket p
 2. Setting the `DOCKER_HOST` environment variable to point to Colima socket.
 
    ```sh
-   export DOCKER_HOST="unix://${HOME}/.colima/default/docker.sock"
+   export DOCKER_HOST="unix://$HOME/.colima/default/docker.sock"
    ```
 3. Linking the Colima socket to the default socket path. **Note** that this may break other Docker servers.
 
@@ -136,7 +235,7 @@ This can be fixed by any of the following approaches. Ensure the Docker socket p
    ```
 
 
-### How to customize Docker config e.g. add insecure registries?
+### How to customize Docker config (e.g., adding insecure registries or registry mirrors)?
 
 * v0.3.4 or lower
 
@@ -160,10 +259,44 @@ This can be fixed by any of the following approaches. Ensure the Docker socket p
   +     - myregistry.com:5000
   +     - host.docker.internal:5000
   ```
+**Note:** In order for the Docker client to respect (at least some) configuration value changes, modification of the host ~/.docker/daemon.json file may also be required.
 
-### Docker plugins are missing (buildx, scan)
+For example, if adding registry mirrors, modifications are needed as follows:
 
-Both `buildx` and `scan` can be installed as Docker plugins
+First, colima:
+
+```sh
+colima start --edit
+```
+
+```diff
+- docker: {}
++ docker:
++   registry-mirrors:
++     - https://my.dockerhub.mirror.something
++     - https://my.quayio.mirror.something
+```
+
+As an alternative approach to the **colima start --edit**, make the changes via the **template** command (affecting the configuration for any new instances):
+
+```sh
+colima template
+```
+
+Then, the Docker ~/.docker/daemon.json file (as compared to the default):
+
+```diff
+- "experimental": false,
++ "experimental": false,
++ "registry-mirrors": [
++   "https://my.dockerhub.mirror.something",
++   "https://my.quayio.mirror.something"
++ ]
+```
+
+### Docker buildx plugin is missing
+
+`buildx` can be installed as a Docker plugin
 
 #### Installing Buildx
 
@@ -178,34 +311,48 @@ docker buildx version # verify installation
 Alternatively
 ```sh
 ARCH=amd64 # change to 'arm64' for m1
-VERSION=v0.8.2
+VERSION=v0.11.2
 curl -LO https://github.com/docker/buildx/releases/download/${VERSION}/buildx-${VERSION}.darwin-${ARCH}
 mkdir -p ~/.docker/cli-plugins
 mv buildx-${VERSION}.darwin-${ARCH} ~/.docker/cli-plugins/docker-buildx
 chmod +x ~/.docker/cli-plugins/docker-buildx
 docker buildx version # verify installation
 ```
-#### Installing Docker Scan
 
-Install Snyk CLI
+## Containerd
+
+### How to customize Containerd config?
+
+On first startup with the containerd runtime, Colima generates default config files at the standard user config locations:
+
+| File | Location |
+|------|----------|
+| Containerd config | `~/.config/containerd/config.toml` |
+| BuildKit config | `~/.config/buildkit/buildkitd.toml` |
+
+These follow the standard rootless containerd/buildkit config paths and are shared across all Colima profiles.
+
+Modify the files accordingly and restart Colima for changes to take effect.
 
 ```sh
-brew install snyk/tap/snyk
+# edit the containerd config
+$EDITOR ~/.config/containerd/config.toml
+
+# restart colima
+colima stop && colima start --runtime containerd
 ```
 
-Install Docker Scan
+#### Per-profile overrides
 
-```sh
-ARCH=amd64 # change to 'arm64' for m1
-VERSION=v0.21.0
-curl -LO https://github.com/docker/scan-cli-plugin/releases/download/${VERSION}/docker-scan_darwin_${ARCH}
-mkdir -p ~/.docker/cli-plugins
-mv docker-scan_darwin_${ARCH} ~/.docker/cli-plugins/docker-scan
-chmod +x ~/.docker/cli-plugins/docker-scan
-mkdir -p ~/.docker/scan
-echo "{}" > ~/.docker/scan/config.json # config file required by the docker scan plugin
-docker scan --version # verify installation
-```
+To use a different config for a specific profile, place the config file at `$HOME/.colima/<profile-name>/containerd/config.toml` (or `buildkitd.toml`). Per-profile configs take priority over the central config.
+
+The resolution order is:
+
+1. `~/.colima/<profile>/containerd/<file>` (per-profile override)
+2. `~/.config/containerd/<file>` or `~/.config/buildkit/<file>` (central)
+3. Embedded default
+
+**Note:** `$XDG_CONFIG_HOME` is respected for the central config location if set.
 
 ## How does Colima compare to minikube, Kind, K3d?
 
@@ -228,12 +375,15 @@ Minikube with Docker runtime can expose the cluster's Docker with `minikube dock
 
 ## Is another Distro supported?
 
+### Version v0.5.6 and lower
+
 Colima uses a lightweight Alpine image with bundled dependencies.
 Therefore, user interaction with the Virtual Machine is expected to be minimal (if any).
 
 However, Colima optionally provides Ubuntu container as a layer.
 
-### Enabling Ubuntu layer
+
+#### Enabling Ubuntu layer
 
 * CLI
   ```
@@ -246,15 +396,19 @@ However, Colima optionally provides Ubuntu container as a layer.
   + layer: true
   ```
 
-### Accessing the underlying Virtual Machine
+#### Accessing the underlying Virtual Machine
 
 When the layer is enabled, the underlying Virtual Machine is abstracted and both the `ssh` and `ssh-config` commands routes to the layer.
 
 The underlying Virtual Machine is still accessible by specifying `--layer=false` to the `ssh` and `ssh-config` commands, or by running `colima` in the SSH session.
 
+### Version v0.6.0 and newer
+
+Colima uses Ubuntu as the underlying image. Other distros are not supported.
+
 ## The Virtual Machine's IP is not reachable
 
-Reachable IP address is not enabled by default due to slower startup time.
+Reachable IP address is not enabled by default due to root privilege and slower startup time.
 
 ### Enable reachable IP address
 
@@ -270,6 +424,31 @@ Reachable IP address is not enabled by default due to slower startup time.
   -  address: false
   +  address: true
   ```
+
+## Incus instances are not reachable from the host
+
+<small>**Requires v0.10.0**</small>
+
+Incus containers and virtual machines are not reachable from the host by default. This is because network address is not enabled by default.
+
+To fix this, stop Colima and restart with network address enabled:
+
+```sh
+colima stop
+colima start --network-address
+```
+
+Or enable it in the config file:
+
+```sh
+colima start --edit
+```
+
+```diff
+network:
+-  address: false
++  address: true
+```
 
 ## How can disk space be recovered?
 
@@ -289,11 +468,105 @@ For Colima v0.5.0 and above, user can manually recover the disk space by running
 colima ssh -- sudo fstrim -a
 ```
 
+## How can disk size be increased?
+
+Disk size is automatically increased on start up based on configuration in `colima.yaml`
+
+```diff
+- disk: 150
++ disk: 250
+```
+
+__Note:__ This feature is available from Version 0.5.3.
+
+
 ## Are Lima overrides supported?
 
 Yes, however this should only be done by advanced users.
 
-Overriding the image is not supported as Colima's image includes bundled dependencies that would be missing in the user specified image.
+Lima supports `override.yaml` and `default.yaml` files that can modify the VM configuration.
+
+The override file is located at `$HOME/.colima/_lima/_config/override.yaml` (or `$LIMA_HOME/_config/override.yaml` if `LIMA_HOME` is set).
+
+Settings in `override.yaml` are applied **before** the instance config, while settings in `default.yaml` are applied **after** (as fallback defaults).
+
+**Note:** Overriding the image is not supported as Colima's image includes bundled dependencies that would be missing in a user-specified image.
+
+### Example: Adding provision scripts
+
+Provision scripts can be added via Lima overrides to run commands during VM boot.
+
+```yaml
+# $HOME/.colima/_lima/_config/override.yaml
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+      # install additional packages
+      apt-get update && apt-get install -y curl
+```
+
+Alternatively, provision scripts can be specified directly in `colima.yaml`:
+
+```sh
+colima start --edit
+```
+
+```diff
+- provision: []
++ provision:
++   - mode: system
++     script: |
++       #!/bin/bash
++       set -eux -o pipefail
++       apt-get update && apt-get install -y curl
+```
+
+## How can the VM and its tools be updated?
+
+### Updating Colima
+
+```sh
+brew upgrade colima
+```
+
+After upgrading, delete and recreate the instance to use the latest VM image:
+
+```sh
+colima delete
+colima start
+```
+
+To test the upgrade without affecting the existing setup, use a separate profile:
+
+```sh
+colima start debug
+```
+
+### Updating the container runtime
+
+From v0.7.6, the container runtime (Docker, containerd) can be updated independently:
+
+```sh
+colima update
+```
+
+This updates Docker (or containerd) to the latest version without needing to update Colima itself.
+
+### Accessing the Virtual Machine
+
+SSH into the VM to inspect or modify it directly:
+
+```sh
+colima ssh
+```
+
+Run a single command without an interactive session:
+
+```sh
+colima ssh -- uname -a
+```
 
 ## Troubleshooting
 
@@ -366,3 +639,35 @@ PING google.com (216.58.223.238): 56 data bytes
 4 packets transmitted, 4 packets received, 0% packet loss
 round-trip min/avg/max = 0.082/0.390/0.557 ms
 ```
+
+### Docker Compose and Buildx showing runc error
+
+#### Version v0.5.6 or lower
+
+Recent versions of Buildkit may show the following error.
+
+```console
+runc run failed: unable to start container process: error during container init: error mounting "cgroup" to rootfs at "/sys/fs/cgroup": mount cgroup:/sys/fs/cgroup/openrc (via /proc/self/fd/6), flags: 0xf, data: openrc: invalid argument
+```
+
+From v0.5.6, start Colima with `--cgroups-v2` flag as a workaround.
+
+**This is fixed in v0.6.0.**
+
+### Issue with Docker bind mount showing empty
+
+When using docker to bind mount a volume (e.g. using `-v` or `--mount`) from the host where the volume is not contained within `/Users/$USER`, the container will start without raising any errors but the mapped mountpoint on the container will be empty.
+
+This is rectified by mounting the volume on the VM, and only then can docker map the volume or any subdirectory. Edit `$HOME/.colima/default/colima.yaml` and add to the `mounts` section (examples are provided within the yaml file), and then run `colima restart`. Start the container again with the desired bind mount and it should show up correctly.
+
+## How can Docker version be updated?
+
+Each Colima release includes the latest Docker version at the time of release.
+
+From v0.7.6, there is a new `colima update` command to update the container runtime without needing to update Colima or to wait for the next Colima release.
+
+## How can I delete container data
+
+From v0.9.0, Colima utilises a different disk for the container runtime data. This guards against accidental data loss after deletion and the container data should be reinstated on `colima start`.
+
+To clear all data, `colima delete --data`  should be run instead. The `--data` flag ensures that the container data is also deleted.

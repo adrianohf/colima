@@ -14,12 +14,14 @@ import (
 	"github.com/abiosoft/colima/config"
 	"github.com/abiosoft/colima/config/configmanager"
 	"github.com/abiosoft/colima/environment"
+	"github.com/abiosoft/colima/environment/container/containerd"
 	"github.com/abiosoft/colima/environment/container/docker"
+	"github.com/abiosoft/colima/environment/container/incus"
 	"github.com/abiosoft/colima/environment/container/kubernetes"
-	"github.com/abiosoft/colima/environment/container/ubuntu"
 	"github.com/abiosoft/colima/environment/host"
 	"github.com/abiosoft/colima/environment/vm/lima"
 	"github.com/abiosoft/colima/environment/vm/lima/limautil"
+	"github.com/abiosoft/colima/store"
 	"github.com/abiosoft/colima/util"
 	"github.com/docker/go-units"
 	log "github.com/sirupsen/logrus"
@@ -29,11 +31,12 @@ type App interface {
 	Active() bool
 	Start(config.Config) error
 	Stop(force bool) error
-	Delete() error
-	SSH(layer bool, args ...string) error
-	Status(extended bool) error
+	Delete(data, force bool) error
+	SSH(args ...string) error
+	Status(extended bool, json bool) error
 	Version() error
 	Runtime() (string, error)
+	Update() error
 	Kubernetes() (environment.Container, error)
 }
 
@@ -55,41 +58,61 @@ type colimaApp struct {
 	guest environment.VM
 }
 
-func (c colimaApp) Start(conf config.Config) error {
-	ctx := context.WithValue(context.Background(), config.CtxKey(), conf)
+func (c colimaApp) startWithRuntime(conf config.Config) ([]environment.Container, error) {
+	kubernetesEnabled := conf.Kubernetes.Enabled
+
+	// Kubernetes can only be enabled for docker and containerd
+	switch conf.Runtime {
+	case docker.Name, containerd.Name:
+	default:
+		kubernetesEnabled = false
+	}
+
+	var containers []environment.Container
 
 	{
 		runtime := conf.Runtime
-		if conf.Kubernetes.Enabled {
+		if kubernetesEnabled {
 			runtime += "+k3s"
 		}
-		log.Println("starting", config.CurrentProfile().DisplayName)
 		log.Println("runtime:", runtime)
 	}
-	var containers []environment.Container
+
 	// runtime
 	{
 		env, err := c.containerEnvironment(conf.Runtime)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		containers = append(containers, env)
 	}
+
 	// kubernetes should come after required runtime
-	if conf.Kubernetes.Enabled {
+	if kubernetesEnabled {
 		env, err := c.containerEnvironment(kubernetes.Name)
 		if err != nil {
-			return err
+			return nil, err
 		}
 		containers = append(containers, env)
 	}
-	// ubuntu layer should come last
-	if conf.Layer {
-		env, err := c.containerEnvironment(ubuntu.Name)
+
+	return containers, nil
+}
+
+func (c colimaApp) Start(conf config.Config) error {
+	ctx := context.WithValue(context.Background(), config.CtxKey(), conf)
+
+	log.Println("starting", config.CurrentProfile().DisplayName)
+	// print the full path of current profile being used
+	log.Tracef("starting with config file: %s\n", config.CurrentProfile().File())
+
+	var containers []environment.Container
+	if !environment.IsNoneRuntime(conf.Runtime) {
+		cs, err := c.startWithRuntime(conf)
 		if err != nil {
 			return err
 		}
-		containers = append(containers, env)
+		containers = cs
 	}
 
 	// the order for start is:
@@ -99,6 +122,9 @@ func (c colimaApp) Start(conf config.Config) error {
 	if err := c.guest.Start(ctx, conf); err != nil {
 		return fmt.Errorf("error starting vm: %w", err)
 	}
+
+	// run after-boot provision scripts
+	c.runProvisionScripts(conf, config.ProvisionModeAfterBoot)
 
 	// provision and start container runtimes
 	for _, cont := range containers {
@@ -112,6 +138,9 @@ func (c colimaApp) Start(conf config.Config) error {
 			return fmt.Errorf("error starting %s: %w", cont.Name(), err)
 		}
 	}
+
+	// run ready provision scripts
+	c.runProvisionScripts(conf, config.ProvisionModeReady)
 
 	// persist the current runtime
 	if err := c.setRuntime(conf.Runtime); err != nil {
@@ -131,6 +160,21 @@ func (c colimaApp) Start(conf config.Config) error {
 	return nil
 }
 
+func (c colimaApp) runProvisionScripts(conf config.Config, mode string) {
+	var failed bool
+	for _, s := range conf.Provision {
+		if s.Mode != mode {
+			continue
+		}
+		if err := c.guest.Run("sh", "-c", s.Script); err != nil {
+			failed = true
+		}
+	}
+	if failed {
+		log.Warnln(fmt.Errorf("error running %s provision script(s)", mode))
+	}
+}
+
 func (c colimaApp) Stop(force bool) error {
 	ctx := context.Background()
 	log.Println("stopping", config.CurrentProfile().DisplayName)
@@ -138,8 +182,8 @@ func (c colimaApp) Stop(force bool) error {
 	// the order for stop is:
 	//   container stop -> vm stop
 
-	// stop container runtimes if not a forceful shutdown
-	if c.guest.Running(ctx) && !force {
+	// stop container runtimes
+	if c.guest.Running(ctx) {
 		containers, err := c.currentContainerEnvironments(ctx)
 		if err != nil {
 			log.Warnln(fmt.Errorf("error retrieving runtimes: %w", err))
@@ -152,7 +196,7 @@ func (c colimaApp) Stop(force bool) error {
 			log := log.WithField("context", cont.Name())
 			log.Println("stopping ...")
 
-			if err := cont.Stop(ctx); err != nil {
+			if err := cont.Stop(ctx, force); err != nil {
 				// failure to stop a container runtime is not fatal
 				// it is only meant for graceful shutdown.
 				// the VM will shut down anyways.
@@ -175,7 +219,29 @@ func (c colimaApp) Stop(force bool) error {
 	return nil
 }
 
-func (c colimaApp) Delete() error {
+func (c colimaApp) Delete(data, force bool) error {
+	confirmContainerDestruction := func() bool {
+		return cli.Prompt("\033[31m\033[1mthis will delete ALL container data. Are you sure you want to continue")
+	}
+
+	s, _ := store.Load()
+	diskInUse := s.DiskFormatted
+
+	if !force {
+		y := cli.Prompt("are you sure you want to delete " + config.CurrentProfile().DisplayName + " and all settings")
+		if !y {
+			return nil
+		}
+
+		// runtime disk not in use or data deletion is requested,
+		// deletion deletes all data, warn accordingly.
+		if !diskInUse || data {
+			if y := confirmContainerDestruction(); !y {
+				return nil
+			}
+		}
+	}
+
 	ctx := context.Background()
 	log.Println("deleting", config.CurrentProfile().DisplayName)
 
@@ -193,7 +259,6 @@ func (c colimaApp) Delete() error {
 			log.Warnln(fmt.Errorf("error retrieving runtimes: %w", err))
 		}
 		for _, cont := range containers {
-
 			log := log.WithField("context", cont.Name())
 			log.Println("deleting ...")
 
@@ -214,6 +279,18 @@ func (c colimaApp) Delete() error {
 		return fmt.Errorf("error deleting configs: %w", err)
 	}
 
+	// delete runtime disk if disk in use and data deletion is requested
+	if diskInUse && data {
+		log.Println("deleting container data")
+		if err := limautil.DeleteDisk(); err != nil {
+			return fmt.Errorf("error deleting container data: %w", err)
+		}
+
+		if err := store.Reset(); err != nil {
+			log.Trace("error resetting store: %w", err)
+		}
+	}
+
 	log.Println("done")
 
 	if err := generateSSHConfig(false); err != nil {
@@ -222,7 +299,7 @@ func (c colimaApp) Delete() error {
 	return nil
 }
 
-func (c colimaApp) SSH(layer bool, args ...string) error {
+func (c colimaApp) SSH(args ...string) error {
 	ctx := context.Background()
 	if !c.guest.Running(ctx) {
 		return fmt.Errorf("%s not running", config.CurrentProfile().DisplayName)
@@ -235,7 +312,7 @@ func (c colimaApp) SSH(layer bool, args ...string) error {
 	// peek the current directory to see if it is mounted to prevent `cd` errors
 	// with limactl ssh
 	if err := func() error {
-		conf, err := limautil.InstanceConfig()
+		conf, err := configmanager.LoadInstance()
 		if err != nil {
 			return err
 		}
@@ -260,98 +337,133 @@ func (c colimaApp) SSH(layer bool, args ...string) error {
 		return fmt.Errorf("not a mounted directory: %s", workDir)
 	}(); err != nil {
 		// the errors returned here is not critical and thereby silenced.
-		// the goal is to prevent unecessary warning message from Lima.
+		// the goal is to prevent unnecessary warning message from Lima.
 		log.Trace(fmt.Errorf("error checking if PWD is mounted: %w", err))
-
-		// fallback to the user's homedir
-		username, err := c.guest.User()
-		if err == nil {
-			workDir = "/home/" + username + ".linux"
-		}
+		workDir = ""
 	}
 
-	if !layer {
-		return c.guest.SSH(workDir, args...)
-	}
-
-	conf, err := limautil.InstanceConfig()
-	if err != nil {
-		return err
-	}
-	if !conf.Layer {
-		return c.guest.SSH(workDir, args...)
-	}
-
-	resp, err := limautil.ShowSSH(config.CurrentProfile().ID, layer, "args")
-	if err != nil {
-		return fmt.Errorf("error getting ssh config: %w", err)
-	}
-	if !resp.Layer {
-		return c.guest.RunInteractive(args...)
-	}
-
-	cmdArgs := resp.Output
-
-	if len(args) > 0 {
-		args = append([]string{"-q", "-t", resp.IPAddress, "--"}, args...)
-	} else if workDir != "" {
-		args = []string{"-q", "-t", resp.IPAddress, "--", "cd " + workDir + " 2> /dev/null; \"$SHELL\" --login"}
-	}
-
-	args = append(util.ShellSplit(cmdArgs), args...)
-	return cli.CommandInteractive("ssh", args...).Run()
+	guest := lima.New(host.New())
+	return guest.SSH(workDir, args...)
 }
 
-func (c colimaApp) Status(extended bool) error {
+type statusInfo struct {
+	DisplayName      string `json:"display_name"`
+	Driver           string `json:"driver"`
+	Arch             string `json:"arch"`
+	Runtime          string `json:"runtime"`
+	MountType        string `json:"mount_type"`
+	IPAddress        string `json:"ip_address,omitempty"`
+	DockerSocket     string `json:"docker_socket,omitempty"`
+	ContainerdSocket string `json:"containerd_socket,omitempty"`
+	BuildkitdSocket  string `json:"buildkitd_socket,omitempty"`
+	IncusSocket      string `json:"incus_socket,omitempty"`
+	Kubernetes       bool   `json:"kubernetes"`
+	CPU              int    `json:"cpu"`
+	Memory           int64  `json:"memory"`
+	Disk             int64  `json:"disk"`
+}
+
+func (c colimaApp) getStatus() (status statusInfo, err error) {
 	ctx := context.Background()
 	if !c.guest.Running(ctx) {
-		return fmt.Errorf("%s is not running", config.CurrentProfile().DisplayName)
+		return status, fmt.Errorf("%s is not running", config.CurrentProfile().DisplayName)
 	}
 
 	currentRuntime, err := c.currentRuntime(ctx)
 	if err != nil {
+		return status, err
+	}
+
+	status.DisplayName = config.CurrentProfile().DisplayName
+	status.Driver = "QEMU"
+	conf, _ := configmanager.LoadInstance()
+	if !conf.Empty() {
+		status.Driver = conf.DriverLabel()
+	}
+	status.Arch = string(c.guest.Arch())
+	status.Runtime = currentRuntime
+	status.MountType = conf.MountType
+	ipAddress := limautil.IPAddress(config.CurrentProfile().ID)
+	if ipAddress != "127.0.0.1" {
+		status.IPAddress = ipAddress
+	}
+	if currentRuntime == docker.Name {
+		status.DockerSocket = "unix://" + docker.HostSocketFile()
+		status.ContainerdSocket = "unix://" + containerd.HostSocketFiles().Containerd
+	}
+	if currentRuntime == containerd.Name {
+		status.ContainerdSocket = "unix://" + containerd.HostSocketFiles().Containerd
+		status.BuildkitdSocket = "unix://" + containerd.HostSocketFiles().Buildkitd
+	}
+	if currentRuntime == incus.Name {
+		status.IncusSocket = "unix://" + incus.HostSocketFile()
+	}
+	if k, err := c.Kubernetes(); err == nil && k.Running(ctx) {
+		status.Kubernetes = true
+	}
+	if inst, err := limautil.Instance(); err == nil {
+		status.CPU = inst.CPU
+		status.Memory = inst.Memory
+		status.Disk = inst.Disk
+	}
+	return status, nil
+}
+
+func (c colimaApp) Status(extended bool, jsonOutput bool) error {
+	status, err := c.getStatus()
+	if err != nil {
 		return err
 	}
 
-	driver := "QEMU"
-	conf, _ := limautil.InstanceConfig()
-	if !conf.Empty() {
-		driver = conf.DriverLabel()
-	}
+	if jsonOutput {
+		if err := json.NewEncoder(os.Stdout).Encode(status); err != nil {
+			return fmt.Errorf("error encoding status as json: %w", err)
+		}
+	} else {
+		log.Println(config.CurrentProfile().DisplayName, "is running using", status.Driver)
+		log.Println("arch:", status.Arch)
+		log.Println("runtime:", status.Runtime)
+		if status.MountType != "" {
+			log.Println("mountType:", status.MountType)
+		}
 
-	log.Println(config.CurrentProfile().DisplayName, "is running using", driver)
-	log.Println("arch:", c.guest.Arch())
-	log.Println("runtime:", currentRuntime)
-	if conf.MountType != "" {
-		log.Println("mountType:", conf.MountType)
-	}
+		// ip address
+		if status.IPAddress != "" {
+			log.Println("address:", status.IPAddress)
+		}
 
-	// ip address
-	if ipAddress := limautil.IPAddress(config.CurrentProfile().ID); ipAddress != "127.0.0.1" {
-		log.Println("address:", ipAddress)
-	}
+		// docker socket
+		if status.DockerSocket != "" {
+			log.Println("docker socket:", status.DockerSocket)
+		}
+		if status.ContainerdSocket != "" {
+			log.Println("containerd socket:", status.ContainerdSocket)
+		}
+		if status.BuildkitdSocket != "" {
+			log.Println("buildkitd socket:", status.BuildkitdSocket)
+		}
+		if status.IncusSocket != "" {
+			log.Println("incus socket:", status.IncusSocket)
+		}
 
-	// docker socket
-	if currentRuntime == docker.Name {
-		log.Println("socket:", "unix://"+docker.HostSocketFile())
-	}
+		// kubernetes
+		if status.Kubernetes {
+			log.Println("kubernetes: enabled")
+		}
 
-	// kubernetes
-	if k, err := c.Kubernetes(); err == nil && k.Running(ctx) {
-		log.Println("kubernetes: enabled")
-	}
-
-	// additional details
-	if extended {
-		log.Println("networkDriver:", conf.Network.Driver)
-
-		if inst, err := limautil.Instance(); err == nil {
-			log.Println("cpu:", inst.CPU)
-			log.Println("mem:", units.BytesSize(float64(inst.Memory)))
-			log.Println("disk:", units.BytesSize(float64(inst.Disk)))
+		// additional details
+		if extended {
+			if status.CPU > 0 {
+				log.Println("cpu:", status.CPU)
+			}
+			if status.Memory > 0 {
+				log.Println("mem:", units.BytesSize(float64(status.Memory)))
+			}
+			if status.Disk > 0 {
+				log.Println("disk:", units.BytesSize(float64(status.Disk)))
+			}
 		}
 	}
-
 	return nil
 }
 
@@ -368,11 +480,8 @@ func (c colimaApp) Version() error {
 
 	var kube environment.Container
 	for _, cont := range containerRuntimes {
-		switch cont.Name() {
-		case kubernetes.Name:
+		if cont.Name() == kubernetes.Name {
 			kube = cont
-			continue
-		case ubuntu.Name:
 			continue
 		}
 
@@ -405,6 +514,17 @@ func (c colimaApp) currentRuntime(ctx context.Context) (string, error) {
 }
 
 func (c colimaApp) setRuntime(runtime string) error {
+	err := store.Set(func(s *store.Store) {
+		// update runtime if runtime disk is in use
+		if s.DiskFormatted {
+			s.DiskRuntime = runtime
+		}
+	})
+
+	if err != nil {
+		log.Traceln(fmt.Errorf("error persisting store: %w", err))
+	}
+
 	return c.guest.Set(environment.ContainerRuntimeKey, runtime)
 }
 
@@ -419,13 +539,17 @@ func (c colimaApp) setKubernetes(conf config.Kubernetes) error {
 
 func (c colimaApp) currentContainerEnvironments(ctx context.Context) ([]environment.Container, error) {
 	var containers []environment.Container
-
 	// runtime
 	{
 		runtime, err := c.currentRuntime(ctx)
 		if err != nil {
 			return nil, err
 		}
+
+		if environment.IsNoneRuntime(runtime) {
+			return nil, nil
+		}
+
 		env, err := c.containerEnvironment(runtime)
 		if err != nil {
 			return nil, err
@@ -436,11 +560,6 @@ func (c colimaApp) currentContainerEnvironments(ctx context.Context) ([]environm
 	// detect and add kubernetes
 	if k, err := c.containerEnvironment(kubernetes.Name); err == nil && k.Running(ctx) {
 		containers = append(containers, k)
-	}
-
-	// detect and add ubuntu layer
-	if u, err := c.containerEnvironment(ubuntu.Name); err == nil && u.Running(ctx) {
-		containers = append(containers, u)
 	}
 
 	return containers, nil
@@ -470,6 +589,41 @@ func (c colimaApp) Active() bool {
 	return c.guest.Running(context.Background())
 }
 
+func (c *colimaApp) Update() error {
+	ctx := context.Background()
+	if !c.guest.Running(ctx) {
+		return fmt.Errorf("runtime cannot be updated, %s is not running", config.CurrentProfile().DisplayName)
+	}
+
+	runtime, err := c.currentRuntime(ctx)
+	if err != nil {
+		return err
+	}
+
+	container, err := c.containerEnvironment(runtime)
+	if err != nil {
+		return err
+	}
+
+	oldVersion := container.Version(ctx)
+
+	updated, err := container.Update(ctx)
+	if err != nil {
+		return err
+	}
+
+	if updated {
+		fmt.Println()
+		fmt.Println("Previous")
+		fmt.Println(oldVersion)
+		fmt.Println()
+		fmt.Println("Current")
+		fmt.Println(container.Version(ctx))
+	}
+
+	return nil
+}
+
 func generateSSHConfig(modifySSHConfig bool) error {
 	instances, err := limautil.Instances()
 	if err != nil {
@@ -482,14 +636,8 @@ func generateSSHConfig(modifySSHConfig bool) error {
 			continue
 		}
 
-		profile := config.Profile(i.Name)
-		conf, err := i.Config()
-		if err != nil {
-			log.Trace(fmt.Errorf("error retrieving profile config for '%s': %w", i.Name, err))
-			continue
-		}
-
-		resp, err := limautil.ShowSSH(profile.ID, conf.Layer, "config")
+		profile := config.ProfileFromName(i.Name)
+		resp, err := limautil.ShowSSH(profile.ID)
 		if err != nil {
 			log.Trace(fmt.Errorf("error retrieving SSH config for '%s': %w", i.Name, err))
 			continue
@@ -498,7 +646,7 @@ func generateSSHConfig(modifySSHConfig bool) error {
 		fmt.Fprintln(&buf, resp.Output)
 	}
 
-	sshFileColima := filepath.Join(filepath.Dir(config.Dir()), "ssh_config")
+	sshFileColima := config.SSHConfigFile()
 	if err := os.WriteFile(sshFileColima, buf.Bytes(), 0644); err != nil {
 		return fmt.Errorf("error writing ssh_config file: %w", err)
 	}
@@ -550,9 +698,14 @@ func generateSSHConfig(modifySSHConfig bool) error {
 			continue
 		}
 
-		if words[0] == "Include" && words[1] == sshFileColima {
-			// already present
-			return nil
+		if words[0] == "Include" {
+			sshConfig := words[1]
+			sshConfig = strings.Replace(sshConfig, "~/", "$HOME/", 1)
+			sshConfig = os.ExpandEnv(sshConfig)
+			if sshConfig == sshFileColima {
+				// already present
+				return nil
+			}
 		}
 	}
 

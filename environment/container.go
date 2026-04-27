@@ -6,6 +6,9 @@ import (
 	"log"
 )
 
+// IsNoneRuntime returns if runtime is none.
+func IsNoneRuntime(runtime string) bool { return runtime == "none" }
+
 // Container is container environment.
 type Container interface {
 	// Name is the name of the container runtime. e.g. docker, containerd
@@ -16,9 +19,12 @@ type Container interface {
 	// Start starts the container runtime.
 	Start(ctx context.Context) error
 	// Stop stops the container runtime.
-	Stop(ctx context.Context) error
+	// If force is true, the runtime is killed immediately without graceful shutdown.
+	Stop(ctx context.Context, force bool) error
 	// Teardown tears down/uninstall the container runtime.
 	Teardown(ctx context.Context) error
+	// Update the container runtime.
+	Update(ctx context.Context) (bool, error)
 	// Version returns the container runtime version.
 	Version(ctx context.Context) string
 	// Running returns if the container runtime is currently running.
@@ -64,4 +70,17 @@ func ContainerRuntimes() (names []string) {
 		names = append(names, name)
 	}
 	return
+}
+
+// DataDisk holds the configuration for mounting an external runtime disk.
+type DataDisk struct {
+	Dirs     []DiskDir // the directories to be mounted
+	PreMount []string  // the scripts to run before mounting the directories
+	FSType   string    // the filesystem type for the disk e.g. ext4
+}
+
+// DiskDir is a directory mounted in a data disk.
+type DiskDir struct {
+	Name string
+	Path string
 }
