@@ -147,6 +147,7 @@ var startCmdArgs struct {
 		Edit                    bool
 		Editor                  string
 		ActivateRuntime         bool
+		ForceDiskImage          bool
 		Binfmt                  bool
 		DNSHosts                []string
 		Foreground              bool
@@ -192,6 +193,7 @@ func init() {
 	startCmd.Flags().BoolVarP(&startCmdArgs.Flags.Foreground, "foreground", "f", false, "Keep colima in the foreground")
 	startCmd.Flags().StringVar(&startCmdArgs.Hostname, "hostname", "", "custom hostname for the virtual machine")
 	startCmd.Flags().StringVarP(&startCmdArgs.DiskImage, "disk-image", "i", "", "file path to a custom disk image")
+	startCmd.Flags().BoolVar(&startCmdArgs.Flags.ForceDiskImage, "force-disk-image", false, "load unsupported disk image")
 	startCmd.Flags().BoolVar(&startCmdArgs.Flags.Template, "template", true, "use the template file for initial configuration")
 
 	// port forwarder
@@ -243,7 +245,7 @@ func init() {
 	// mounts
 	startCmd.Flags().StringSliceVarP(&startCmdArgs.Flags.Mounts, "mount", "V", nil, "directories to mount, suffix ':w' for writable, disable with 'none'")
 	startCmd.Flags().StringVar(&startCmdArgs.MountType, "mount-type", defaultMountType, "volume driver for the mount ("+mounts+")")
-	startCmd.Flags().BoolVar(&startCmdArgs.MountINotify, "mount-inotify", true, "propagate inotify file events to the VM")
+	startCmd.Flags().BoolVar(&startCmdArgs.MountINotify, "mount-inotify", false, "propagate inotify file events to the VM")
 
 	// ssh
 	startCmd.Flags().BoolVarP(&startCmdArgs.ForwardAgent, "ssh-agent", "s", false, "forward SSH agent to the VM")
@@ -458,6 +460,7 @@ func prepareConfig(cmd *cobra.Command) {
 	startCmdArgs.Network.DNSHosts = dnsHostsFromFlag(startCmdArgs.Flags.DNSHosts)
 	startCmdArgs.ActivateRuntime = &startCmdArgs.Flags.ActivateRuntime
 	startCmdArgs.Binfmt = &startCmdArgs.Flags.Binfmt
+	startCmdArgs.ForceDiskImage = &startCmdArgs.Flags.ForceDiskImage
 
 	// handle legacy kubernetes-disable
 	for _, disable := range startCmdArgs.Flags.LegacyKubernetesDisable {
@@ -580,6 +583,11 @@ func prepareConfig(cmd *cobra.Command) {
 	if !cmd.Flag("binfmt").Changed {
 		if current.Binfmt != nil {
 			startCmdArgs.Binfmt = current.Binfmt
+		}
+	}
+	if !cmd.Flag("force-disk-image").Changed {
+		if current.ForceDiskImage != nil {
+			startCmdArgs.ForceDiskImage = current.ForceDiskImage
 		}
 	}
 	if !cmd.Flag("network-host-addresses").Changed {
