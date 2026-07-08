@@ -246,10 +246,6 @@ If you (or your company) are benefiting from the project and would like to suppo
 - [Buy me a coffee](https://www.buymeacoffee.com/abiosoft)
 - [Patreon](https://patreon.com/colima)
 
-#### Web3
-
-- Solana contract address: `95ysUPj5ug8vKdU9hFo5FvLhJTRoYha83VK1fGrSpump`.
-
 ---
 
 [<img src="https://uploads-ssl.webflow.com/5ac3c046c82724970fc60918/5c019d917bba312af7553b49_MacStadium-developerlogo.png" style="max-height: 150px"/>](https://macstadium.com)
